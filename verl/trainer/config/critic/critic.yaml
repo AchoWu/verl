@@ -49,6 +49,12 @@ model:
   # Whether to trust remote code from Hugging Face models
   trust_remote_code: ${oc.select:actor_rollout_ref.model.trust_remote_code,false}
 
+  # JustRL-II critic value-head seeding. When set, the scalar value head's weight is
+  # zero-initialized and its bias filled with this value, so V == bias at step 0 and the bias is
+  # the critic's prior. Set it to the expected mean reward (on a 0/1 reward, the base model's
+  # pass rate). null keeps the default HF init.
+  value_head_bias_init: null
+
 # PPO mini-batch size per update
 ppo_mini_batch_size: ${oc.select:actor_rollout_ref.actor.ppo_mini_batch_size,256}
 

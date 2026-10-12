@@ -1,0 +1,45 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  # With filter_groups off, every generated group trains, so over-sampling would just waste
+  # rollout time -- keep gen == train. These two must be set together; gen_batch_size does NOT
+  # track train_batch_size automatically. run_justrl2_16k.sh passes both.
+  train_batch_size: 32
+  gen_batch_size: 32
+
+reward_model:
+  reward_manager: dapo
+  # DAPO soft overlong punishment. `exclude_from_critic` is the JustRL-II addition: the reward
+  # manager then also emits the pre-penalty score, which becomes the critic's regression target
+  # while the actor keeps using the shaped reward.
+  overlong_buffer:
+    enable: False
+    len: 0
+    penalty_factor: 0.0
+    log: False
+    exclude_from_critic: False
+
+algorithm:
+  # JustRL-II: length-adaptive advantages (lambda_i = k ** (1 / L_i)), lambda=1 critic targets.
+  adv_estimator: gae_length_adaptive
+  # gamma MUST stay 1.0: the decoupled returns are the suffix reward sum, which only equals the
+  # unbiased lambda=1 return when undiscounted. validate_config asserts this.
+  gamma: 1.0
+  gae_lambda_k: 0.5
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False
+    metric: null
+    max_num_gen_batches: 0
+
+critic:
+  enable: True
+
+trainer:
+  project_name: verl-justrl2

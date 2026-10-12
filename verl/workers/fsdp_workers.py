@@ -1264,6 +1264,23 @@ class CriticWorker(Worker, DistProfilerExtension):
                 config.model.get("trust_remote_code", False),
             )
 
+            # JustRL-II value-head seeding. The head is freshly built by HF (it is not in the
+            # policy checkpoint), so this only has to run at construction -- unlike megatron's
+            # dist-ckpt reader, which fills a [1, H] head from the overlapping region of the
+            # [vocab, H] LM head and would need a post-load re-zero.
+            bias_init = config.model.get("value_head_bias_init", None)
+            if bias_init is not None:
+                from verl.utils.model import seed_scalar_value_head
+
+                if seed_scalar_value_head(critic_module, bias_init):
+                    print(f"[critic-value-head] zero weight + bias={bias_init} (V == bias at step 0)")
+                elif torch.distributed.get_rank() == 0:
+                    warnings.warn(
+                        "critic.model.value_head_bias_init is set but no scalar value head was "
+                        "found; the critic keeps its default init.",
+                        stacklevel=2,
+                    )
+
             use_remove_padding = config.model.get("use_remove_padding", False)
 
             apply_monkey_patch(

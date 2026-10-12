@@ -38,6 +38,7 @@ from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
     apply_kl_penalty,
+    attach_critic_token_level_rewards,
     compute_advantage,
     compute_response_mask,
 )
@@ -192,6 +193,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                             new_batch.non_tensor_batch.update(
                                 {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                             )
+
+                        # JustRL-II: the critic's de-shaped target, built here (not in the base
+                        # trainer) because this loop overrides fit() wholesale.
+                        attach_critic_token_level_rewards(new_batch)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

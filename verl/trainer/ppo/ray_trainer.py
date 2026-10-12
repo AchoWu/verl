@@ -161,6 +161,45 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+def attach_critic_token_level_rewards(data: DataProto) -> None:
+    """JustRL-II --critic-exclude-overlong-penalty: build the critic's de-shaped reward.
+
+    The DAPO reward manager emits a second, pre-penalty score per sample alongside the shaped
+    one. Lay it out exactly like ``token_level_scores`` so the critic regresses "will this be
+    correct" rather than a mixture of correctness and length -- which it cannot predict
+    mid-generation anyway. The actor's advantage keeps using the fully shaped reward.
+
+    No-op when the reward manager did not emit the field, so this is safe to call
+    unconditionally.
+
+    The write index is derived from ``attention_mask`` rather than ``response_mask``: that is
+    what the reward manager itself uses to place the shaped reward, so the two land on the same
+    token by construction, and ``response_mask`` is not yet present at this point in the DAPO
+    trainer's loop.
+
+    Call it BEFORE ``apply_kl_penalty``: the in-reward KL term shapes the actor's objective and
+    is not part of the critic's target.
+    """
+    if "critic_reward_score" not in data.non_tensor_batch:
+        return
+
+    token_level_scores = data.batch["token_level_scores"]
+    prompt_length = data.batch["prompts"].shape[-1]
+    valid_response_length = data.batch["attention_mask"][:, prompt_length:].sum(dim=-1)
+
+    critic_scores = torch.as_tensor(
+        np.asarray(data.non_tensor_batch["critic_reward_score"], dtype=np.float32),
+        dtype=token_level_scores.dtype,
+        device=token_level_scores.device,
+    )
+    critic_rewards = torch.zeros_like(token_level_scores)
+    last_idx = valid_response_length.long() - 1
+    valid = last_idx >= 0
+    rows = torch.arange(critic_rewards.size(0), device=critic_rewards.device)
+    critic_rewards[rows[valid], last_idx[valid]] = critic_scores[valid]
+    data.batch["critic_token_level_rewards"] = critic_rewards
+
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -248,6 +287,19 @@ def compute_advantage(
             "response_mask": data.batch["response_mask"],
             "config": config,
         }
+        # Critic-based estimators (e.g. gae_length_adaptive) need the value predictions and the
+        # discount knobs, which the GAE branch above passes explicitly. Gate on the estimator
+        # rather than on `"values" in data.batch`: the batch carries values whenever a critic is
+        # enabled, and the group-baseline estimators (grpo_vectorized) take no `values` kwarg,
+        # so passing it unconditionally is a TypeError on an otherwise valid config.
+        if adv_estimator in (AdvantageEstimator.GAE_LENGTH_ADAPTIVE, "gae_length_adaptive"):
+            adv_kwargs["values"] = data.batch["values"]
+            adv_kwargs["gamma"] = gamma
+            adv_kwargs["lam"] = lam
+            # JustRL-II --critic-exclude-overlong-penalty: a second per-token reward without
+            # the soft overlong punishment, used only for the critic's regression target.
+            if "critic_token_level_rewards" in data.batch:  # optional
+                adv_kwargs["critic_token_level_rewards"] = data.batch["critic_token_level_rewards"]
         if "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
@@ -1141,6 +1193,8 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        attach_critic_token_level_rewards(batch)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
