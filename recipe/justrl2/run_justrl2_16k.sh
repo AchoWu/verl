@@ -113,14 +113,14 @@ infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 critic_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2 / sp_size))
 
 # ---- schedule ---------------------------------------------------------------------------
-# 500 steps, as JustRL-II's NUM_ROLLOUT. total_training_steps overrides the epoch count, so
+# 1000 steps (JustRL-II runs 500). total_training_steps overrides the epoch count, so
 # total_epochs=1 only matters if you drop it: one epoch of UltraData-RL-Math is
-# floor(32412 / 32) = 1012 steps, so 500 steps covers 16,000 prompts, about half of it.
+# floor(32412 / 32) = 1012 steps, so 1000 steps covers 32,000 prompts, nearly all of it once.
 total_epochs=${TOTAL_EPOCHS:-1}
-total_training_steps=${TOTAL_TRAINING_STEPS:-500}
-save_freq=${SAVE_FREQ:-25}
+total_training_steps=${TOTAL_TRAINING_STEPS:-1000}
+save_freq=${SAVE_FREQ:-50}
 # Aligned with save_freq so every checkpoint has a matching eval point.
-test_freq=${TEST_FREQ:-25}
+test_freq=${TEST_FREQ:-50}
 
 # ---- Ray / paths ------------------------------------------------------------------------
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}

@@ -233,12 +233,12 @@ The critic also skips the in-reward KL penalty for the same reason.
   advantage, so this changes the training signal rather than only the throughput. Turn it on with
   `algorithm.filter_groups.enable=True algorithm.filter_groups.metric=acc data.gen_batch_size=64`.
 - **No partial rollout** — verl 0.6 has no equivalent.
-- **Batch and schedule**: GBS 256 (JustRL-II 1-node 16k: 64). `trainer.total_training_steps=500`
-  matches JustRL-II's 500 rollouts and overrides `total_epochs=1`. One epoch of
-  UltraData-RL-Math is ⌊32,412 / 32⌋ = 1,012 steps (no prompt exceeds the 2048-token budget, so
-  none are filtered), so 500 steps see 16,000 prompts — about half the set. JustRL-II's 1-node
-  16k run trains on 500 × 8 = 4,000 prompts (more are generated, then dropped by dynamic
-  sampling).
+- **Batch and schedule**: GBS 256 (JustRL-II 1-node 16k: 64). `trainer.total_training_steps=1000`
+  (JustRL-II runs 500 rollouts) overrides `total_epochs=1`; checkpoints and AIME evals every 50
+  steps. One epoch of UltraData-RL-Math is ⌊32,412 / 32⌋ = 1,012 steps (no prompt exceeds the
+  2048-token budget, so none are filtered), so 1000 steps see 32,000 prompts — nearly the whole
+  set once, each row at most once. JustRL-II's 1-node 16k run trains on 500 × 8 = 4,000
+  prompts (more are generated, then dropped by dynamic sampling).
 
 ### Misconfigurations fail loudly
 
