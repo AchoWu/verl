@@ -117,6 +117,49 @@ def _validate_score_centering_config(config: DictConfig) -> None:
         raise ValueError("score centering cannot be combined with distillation.")
 
 
+def _validate_length_adaptive_gae_config(config: DictConfig, use_critic: bool) -> None:
+    """Preconditions for the JustRL-II length-adaptive decoupled GAE estimator.
+
+    Each of these is a silent-failure mode rather than a crash, which is why they are hard
+    errors: the estimator would quietly degrade into ordinary GAE (or regress the critic
+    against the wrong reward) while every metric still looks healthy.
+    """
+    if config.algorithm.adv_estimator != "gae_length_adaptive":
+        if config.algorithm.get("gae_lambda_k") is not None:
+            raise ValueError(
+                f"algorithm.gae_lambda_k is set but algorithm.adv_estimator="
+                f"{config.algorithm.adv_estimator!r} ignores it. Set "
+                f"adv_estimator=gae_length_adaptive, or drop gae_lambda_k."
+            )
+        return
+
+    if not use_critic:
+        raise ValueError(
+            "adv_estimator=gae_length_adaptive needs a critic to produce the values it "
+            "bootstraps from. Set critic.enable=True."
+        )
+    if config.algorithm.get("gae_lambda_k") is None:
+        raise ValueError(
+            "adv_estimator=gae_length_adaptive requires algorithm.gae_lambda_k (the fraction "
+            "of terminal credit reaching the first token; JustRL-II's release value is 0.5)."
+        )
+    if float(config.algorithm.gamma) != 1.0:
+        raise ValueError(
+            f"adv_estimator=gae_length_adaptive requires algorithm.gamma=1.0 -- its value "
+            f"target is the undiscounted suffix reward sum -- but got {config.algorithm.gamma}."
+        )
+    # The v0 fit loop never writes `critic_token_level_rewards`, so the critic would silently
+    # regress the penalty-shaped reward and mechanism 4 would be off with no indication.
+    if not config.trainer.get("use_v1", True):
+        overlong_cfg = (config.get("reward") or {}).get("reward_kwargs", {}).get("overlong_buffer_cfg") or {}
+        if overlong_cfg.get("exclude_from_critic", False):
+            raise ValueError(
+                "overlong_buffer_cfg.exclude_from_critic=True requires the v1 trainer "
+                "(trainer.use_v1=True); the legacy loop does not plumb the critic's "
+                "de-shaped reward."
+            )
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -131,6 +174,8 @@ def validate_config(
     """
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+
+    _validate_length_adaptive_gae_config(config, use_critic)
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":

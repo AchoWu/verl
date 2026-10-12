@@ -464,6 +464,61 @@ def patch_valuehead_model(model) -> None:
     model._no_split_modules = getattr(model.pretrained_model, "_no_split_modules", [])
 
 
+def find_scalar_value_head(model) -> Optional[torch.nn.Linear]:
+    """Return the scalar value head of a critic model, or None if there is no single one.
+
+    Covers both critic constructions verl uses: ``*ForTokenClassification.score`` (num_labels=1)
+    and TRL's ``AutoModelForCausalLMWithValueHead.v_head.summary``.
+    """
+    for attr_path in ("score", "v_head.summary"):
+        module = model
+        for attr in attr_path.split("."):
+            module = getattr(module, attr, None)
+            if module is None:
+                break
+        if isinstance(module, torch.nn.Linear) and module.out_features == 1:
+            return module
+    return None
+
+
+def seed_scalar_value_head(model, bias_init: float) -> bool:
+    """JustRL-II value-head seeding: zero the scalar head's weight, fill its bias.
+
+    With a zero weight ``V == bias`` for every token at step 0, so the bias *is* the critic's
+    prior and should be set to the expected mean reward. The default ``normal(0, 0.02)`` init
+    gives ``std(V) = 0.02 * sqrt(H) * rms(h) ~ 9.7`` on a 2048-wide hidden state while the
+    value targets live in ``[0, 1]``; the critic then spends its first ~25 steps unlearning
+    that offset *while the policy already updates against it*. Seeded at the mean reward the
+    value loss opens at ``Var(r)`` instead of ``E[r^2]`` and the first critic gradient norm is
+    ~3x smaller. The gradient still flows from step 0 because ``dV/dw = h != 0``.
+
+    Must run before FSDP wrapping / weight sync, on the rank that holds real (non-meta) weights.
+
+    Args:
+        model: the critic module, before sharding.
+        bias_init (float): value to fill the head's bias with.
+
+    Returns:
+        bool: True when a head was found and seeded.
+    """
+    head = find_scalar_value_head(model)
+    if head is None:
+        return False
+    if head.weight.is_meta:
+        # Non-zero FSDP ranks build the module on meta tensors and receive rank 0's weights via
+        # sync_module_states / fsdp2_load_full_state_dict, so seeding there is both impossible
+        # and unnecessary.
+        return False
+    with torch.no_grad():
+        head.weight.zero_()
+        if head.bias is None:
+            head.bias = torch.nn.Parameter(
+                torch.zeros(head.out_features, dtype=head.weight.dtype, device=head.weight.device)
+            )
+        head.bias.fill_(float(bias_init))
+    return True
+
+
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
 

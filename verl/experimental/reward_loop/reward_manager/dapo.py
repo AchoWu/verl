@@ -115,5 +115,12 @@ class DAPORewardManager(RewardManagerBase):
             if self.overlong_buffer_cfg.log:
                 reward_extra_info["overlong_reward"] = overlong_reward
                 reward_extra_info["overlong"] = overlong_reward < 0
+            if self.overlong_buffer_cfg.get("exclude_from_critic", False):
+                # JustRL-II --critic-exclude-overlong-penalty: the critic regresses the reward
+                # WITHOUT the length shaping, so the value head models "will this be correct"
+                # rather than a mixture of correctness and length. The actor's advantage still
+                # uses the fully shaped `reward`. Consumed by the trainer, which turns it into
+                # `critic_token_level_rewards`.
+                reward_extra_info["critic_reward_score"] = float(score)
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}

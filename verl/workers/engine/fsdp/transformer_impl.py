@@ -308,6 +308,22 @@ class FSDPEngine(BaseEngine):
                     trust_remote_code=self.model_config.trust_remote_code,
                 )
 
+                # JustRL-II value-head seeding. The head is freshly built by HF (it is not in
+                # the policy checkpoint), so this only has to run at construction -- unlike
+                # megatron's dist-ckpt reader, which fills a [1, H] head from the overlapping
+                # region of the [vocab, H] LM head and needs a post-load re-zero.
+                bias_init = getattr(self.model_config, "value_head_bias_init", None)
+                if bias_init is not None:
+                    from verl.utils.model import seed_scalar_value_head
+
+                    if seed_scalar_value_head(module, bias_init):
+                        logger.info(f"[critic-value-head] zero weight + bias={bias_init} (V == bias at step 0)")
+                    elif torch.distributed.get_rank() == 0:
+                        logger.warning(
+                            "model.value_head_bias_init is set but no scalar value head was "
+                            "found; the critic keeps its default init."
+                        )
+
             use_liger = self.model_config.use_liger
             # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
             if use_liger:

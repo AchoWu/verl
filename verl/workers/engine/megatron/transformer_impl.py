@@ -288,6 +288,21 @@ class MegatronEngine(BaseEngine):
             # override to the provider after it is created.
             self.model_config.hf_config.tie_word_embeddings = False
             self.share_embeddings_and_output_weights = False
+            if getattr(self.model_config, "value_head_bias_init", None) is not None:
+                # Seeding the head at construction is not enough on this backend: megatron's
+                # dist-ckpt reader fills the [1, H] value head from the overlapping region of
+                # the policy's [vocab, H] LM head instead of raising (language_module.py marks
+                # output_layer.* allow_shape_mismatch for vocab padding), so the seeded values
+                # would be silently overwritten. Supporting this needs a post-load re-zero plus
+                # optimizer.reload_model_params() to fix up the fp32 master weights. Fail loudly
+                # rather than ignore a knob the user set for a reason.
+                raise NotImplementedError(
+                    "model.value_head_bias_init is only supported on the FSDP backend. The "
+                    "megatron critic loads its value head through a dist checkpoint, which "
+                    "would overwrite the seeded values after construction. Use "
+                    "critic.strategy=fsdp2, or unset value_head_bias_init to accept the "
+                    "default head init."
+                )
         if self.engine_config.dynamic_context_parallel:
             override_transformer_config.update(
                 {

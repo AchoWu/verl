@@ -135,6 +135,50 @@ class PPOTrainer(ABC):
         # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
         self.local_trigger_step = 0
         self._restored_tq_prompt_count = 0
+        self._critic_excludes_overlong_penalty = self._resolve_critic_excludes_overlong_penalty()
+
+    def _resolve_critic_excludes_overlong_penalty(self) -> bool:
+        """JustRL-II --critic-exclude-overlong-penalty: is the critic's target de-shaped?
+
+        Requires a critic and the DAPO overlong penalty with ``exclude_from_critic=True``; the
+        reward manager then emits a second pre-penalty score per sample. Resolved once at init
+        so `_compute_advantage` does not request a TransferQueue field that was never written.
+
+        Misconfigurations raise here rather than silently disabling the mechanism: a run that
+        trains the critic on the shaped reward looks completely healthy from the metrics, so a
+        warning would be read as noise and the whole point of the flag lost.
+        """
+        if not self.use_critic:
+            return False
+        overlong_cfg = (
+            self.config.reward.get("reward_kwargs", {}).get("overlong_buffer_cfg", None)
+            if self.config.get("reward", None)
+            else None
+        )
+        if overlong_cfg is None or not overlong_cfg.get("exclude_from_critic", False):
+            return False
+        if not overlong_cfg.get("enable", False):
+            raise ValueError(
+                "overlong_buffer_cfg.exclude_from_critic=True requires "
+                "overlong_buffer_cfg.enable=True: with no penalty applied there is nothing to "
+                "exclude, and the critic would regress a reward that never existed."
+            )
+        # Only the DAPO reward manager emits `critic_reward_score`. Another manager leaves the
+        # field absent, and `_compute_advantage` would then ask TransferQueue for a key nobody
+        # wrote. Custom managers that do emit it can be allowlisted here.
+        manager_name = self.config.reward.reward_manager.name
+        if manager_name != "dapo":
+            raise ValueError(
+                f"overlong_buffer_cfg.exclude_from_critic=True needs a reward manager that "
+                f"emits 'critic_reward_score' in reward_extra_info, but "
+                f"reward.reward_manager.name={manager_name!r}. Use 'dapo', or emit that key "
+                f"from your manager and allowlist it here."
+            )
+        logger.info(
+            "critic_exclude_overlong_penalty: ON - the critic's returns are computed from "
+            "rewards WITHOUT the soft overlong punishment; actor advantages are unchanged."
+        )
+        return True
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         """Instantiate the replay buffer (or a user-provided custom sampler).
@@ -1572,6 +1616,21 @@ class PPOTrainer(ABC):
         write_back = {"rm_scores": rm_scores}
         for key in rm_output.meta_info.get("reward_extra_keys", []):
             write_back[key] = rm_output.non_tensor_batch[key]
+        # JustRL-II --critic-exclude-overlong-penalty: lay the pre-penalty score out like
+        # rm_scores so `_compute_advantage` sees the same `critic_rm_scores` field the async
+        # reward-loop path produces in AgentLoopOutput.as_dict().
+        if "critic_reward_score" in write_back:
+            critic_scores = write_back.pop("critic_reward_score")
+            write_back["critic_rm_scores"] = torch.nested.as_nested_tensor(
+                [
+                    torch.nn.functional.pad(
+                        torch.tensor([float(critic_scores[i])], dtype=torch.float32),
+                        (int(response_lengths[i]) - 1, 0),
+                    )
+                    for i in range(len(batch))
+                ],
+                layout=torch.jagged,
+            )
         tq.kv_batch_put(
             keys=batch.keys,
             partition_id=batch.partition_id,
@@ -1743,6 +1802,10 @@ class PPOTrainer(ABC):
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
         fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        # JustRL-II --critic-exclude-overlong-penalty: optional second reward, without the soft
+        # overlong punishment, for the critic's regression target only.
+        if self._critic_excludes_overlong_penalty:
+            fields.append("critic_rm_scores")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         response_mask = data["response_mask"]
@@ -1758,6 +1821,11 @@ class PPOTrainer(ABC):
             metrics.update(kl_metrics)
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+
+        # The critic's target intentionally skips the in-reward KL penalty applied above: it is
+        # a shaping term on the actor's objective, not part of "will this answer be correct".
+        if "critic_rm_scores" in data.batch:
+            data.batch["critic_token_level_rewards"] = data.batch["critic_rm_scores"]
 
         # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
         # Only runs in decoupled mode (computes once per batch using stable π_old)

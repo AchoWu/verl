@@ -77,6 +77,11 @@ algorithm:
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: gae
 
+  # JustRL-II length-adaptive GAE (adv_estimator: gae_length_adaptive): the fraction of terminal
+  # credit that reaches the first token, applied as a per-sample lambda_i = k ** (1 / L_i).
+  # Requires gamma: 1.0. null disables. The JustRL-II release value is 0.5.
+  gae_lambda_k: null
+
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 

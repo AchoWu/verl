@@ -95,6 +95,15 @@ class HFModelConfig(BaseConfig):
     # model type, e.g., "language_model", "value_model"
     model_type: str = "language_model"
 
+    # JustRL-II value-head seeding (model_type="value_model" only). When set, the scalar value
+    # head's weight is zero-initialized and its bias filled with this value, so V == bias at
+    # step 0 and the bias *is* the critic's prior. Set it to the expected mean reward (i.e. the
+    # base model's pass rate on the training mix) so the value loss opens at ~Var(r) instead of
+    # ~E[r^2]. The default HF init (normal(0, 0.02)) gives std(V) ~ 0.02*sqrt(H)*rms(h) ~ 9.7
+    # against targets in [0, 1], which the critic spends its first ~25 steps unlearning while
+    # the policy already updates against it. None keeps the HF default.
+    value_head_bias_init: Optional[float] = None
+
     # whether to load tokenizer. This is useful when we only want to load model config
     load_tokenizer: bool = True
 

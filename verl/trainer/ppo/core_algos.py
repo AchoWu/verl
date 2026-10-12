@@ -108,6 +108,7 @@ class AdvantageEstimator(str, Enum):
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
+    GAE_LENGTH_ADAPTIVE = "gae_length_adaptive"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -260,6 +261,127 @@ def compute_gae_advantage_return(
 
         returns = advantages + values
         advantages = verl_F.masked_whiten(advantages, response_mask)
+    return advantages, returns
+
+
+def length_adaptive_lambda(k: float, response_lengths: torch.Tensor) -> torch.Tensor:
+    """JustRL-II length-adaptive GAE lambda: per-sample ``lambda_i = k ** (1 / L_i)``.
+
+    ``k`` is the fraction of terminal credit that reaches the first token: with gamma=1 the
+    GAE weight of the terminal reward at distance d is ``lambda_i ** d``, so the first token
+    always sees ``lambda_i ** L_i == k`` regardless of response length. Longer responses get a
+    lambda closer to 1, so credit propagation does not weaken with length. A fixed lambda
+    cannot do this: at lambda=0.999 the first token of a 10k response receives 4.5e-5 of the
+    terminal reward, and of a 100k response 3e-44.
+
+    Computed in float32 regardless of the caller's dtype: at 128k lengths ``k ** (1 / L)`` is
+    ``1 - 8e-6``-ish, which bf16 rounds to exactly 1.0 and the mechanism silently disappears.
+    ``L_i == 0`` (empty response) gives lambda=0; such rows are fully masked downstream.
+
+    Args:
+        k (float): fraction of terminal credit reaching the first token, in (0, 1].
+        response_lengths (torch.Tensor): shape (bs,), per-sample response length.
+
+    Returns:
+        torch.Tensor: shape (bs,), float32 per-sample lambda.
+    """
+    if not 0.0 < k <= 1.0:
+        raise ValueError(f"gae_lambda_k must be in (0, 1], got {k}")
+    lengths = response_lengths.to(torch.float32)
+    return torch.where(
+        lengths > 0,
+        float(k) ** (1.0 / lengths.clamp(min=1.0)),
+        torch.zeros_like(lengths),
+    )
+
+
+@register_adv_est(AdvantageEstimator.GAE_LENGTH_ADAPTIVE)  # or simply: @register_adv_est("gae_length_adaptive")
+def compute_length_adaptive_gae_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: torch.Tensor,
+    lam: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    critic_token_level_rewards: Optional[torch.Tensor] = None,
+    **kwargs,
+):
+    """JustRL-II decoupled GAE: length-adaptive advantages, unbiased critic targets.
+
+    Two departures from `compute_gae_advantage_return`:
+
+    1. The *advantage* uses a per-sample ``lambda_i = k ** (1 / L_i)`` (see
+       `length_adaptive_lambda`) instead of the scalar ``lam``, so the terminal reward reaches
+       the first token with a length-independent weight. ``lam`` is ignored.
+    2. The *value target* (returns) is the lambda=1 suffix sum of the rewards rather than
+       ``advantages + values``. The critic therefore regresses an unbiased return while the
+       actor's advantage uses the length-adaptive discount. This requires gamma == 1.
+
+    When ``critic_token_level_rewards`` is given, the returns are computed from it instead of
+    from ``token_level_rewards`` (the advantage is unaffected). That is how
+    `--critic-exclude-overlong-penalty` is expressed here: the actor sees ``r - penalty(L)``
+    while the critic regresses plain ``r``, so the value head models "will this be correct"
+    rather than a mixture of correctness and length.
+
+    Args:
+        token_level_rewards (torch.Tensor): shape (bs, response_length), shaped reward used
+            for the advantage.
+        values (torch.Tensor): shape (bs, response_length), critic predictions.
+        response_mask (torch.Tensor): shape (bs, response_length).
+        gamma (torch.Tensor): discount factor; must be 1.0 here.
+        lam (torch.Tensor): unused, kept for signature compatibility with the GAE estimator.
+        config (AlgoConfig): supplies ``gae_lambda_k``.
+        critic_token_level_rewards (torch.Tensor, optional): shape (bs, response_length),
+            reward used for the critic's regression target. Defaults to
+            ``token_level_rewards``.
+        **kwargs: ignored. `compute_advantage` passes the group `index` (and other optional
+            keys) to every registry-dispatched estimator; this one has no group baseline.
+
+    Returns:
+        advantages (torch.Tensor): shape (bs, response_length), whitened.
+        returns (torch.Tensor): shape (bs, response_length).
+    """
+    k = None if config is None else getattr(config, "gae_lambda_k", None)
+    if k is None:
+        raise ValueError(
+            "adv_estimator=gae_length_adaptive requires algorithm.gae_lambda_k to be set "
+            "(JustRL-II's release value is 0.5)."
+        )
+    if float(gamma) != 1.0:
+        raise ValueError(
+            f"length-adaptive decoupled GAE requires gamma == 1.0 (returns are the suffix reward sum), got {gamma}."
+        )
+
+    with torch.no_grad():
+        # Response length from the mask, so tokens dropped by e.g. DAPO overlong filtering do
+        # not inflate L_i (and hence lambda_i) relative to the credit that actually flows.
+        response_lengths = response_mask.sum(dim=-1)
+        # Do NOT cast lambda to the batch dtype. The critic's values come out of an
+        # autocast(bf16) forward, and bf16 rounds lambda to 1.0 for every L >= 512 (and to a
+        # visibly wrong value below that), which silently degrades this estimator into plain
+        # lambda=1 GAE -- no error, no metric, just the mechanism gone. Keeping lambda in fp32
+        # also promotes `delta` and the GAE accumulator to fp32, which a 14k-step scan needs
+        # regardless. `values` is upcast for the same reason.
+        lam_rowwise = length_adaptive_lambda(k, response_lengths)
+
+        # Advantage: per-sample lambda. `delta` inside the GAE scan is (bs,), so a (bs,)
+        # lambda broadcasts against it directly.
+        advantages, _ = compute_gae_advantage_return(
+            token_level_rewards=token_level_rewards.to(torch.float32),
+            values=values.to(torch.float32),
+            response_mask=response_mask,
+            gamma=gamma,
+            lam=lam_rowwise,
+        )
+
+        # Returns: lambda=1 target, independent of `values`. With gamma=1 the GAE return
+        # collapses to the suffix sum of the rewards. fp32 for the same reason as above: a
+        # 14k-element cumsum in bf16 loses small terminal rewards to rounding.
+        returns_rewards = token_level_rewards if critic_token_level_rewards is None else critic_token_level_rewards
+        returns_rewards = returns_rewards.to(torch.float32) * response_mask
+        returns = torch.flip(torch.cumsum(torch.flip(returns_rewards, dims=[-1]), dim=-1), dims=[-1])
+        returns = returns * response_mask
+
     return advantages, returns
 
 

@@ -253,6 +253,22 @@ def compute_advantage(
             "response_mask": data.batch["response_mask"],
             "config": config,
         }
+        # Critic-based estimators (e.g. gae_length_adaptive) need the value predictions and the
+        # discount knobs, which the GAE branch above passes explicitly. Gate on the estimator
+        # rather than on `"values" in data.batch`: the batch carries values whenever a critic is
+        # enabled, and the group-baseline estimators (grpo_vectorized) take no `values` kwarg,
+        # so passing it unconditionally is a TypeError on an otherwise valid config.
+        if adv_estimator in (AdvantageEstimator.GAE_LENGTH_ADAPTIVE, "gae_length_adaptive"):
+            adv_kwargs["values"] = data.batch["values"]
+            adv_kwargs["gamma"] = gamma
+            adv_kwargs["lam"] = lam
+            # JustRL-II --critic-exclude-overlong-penalty: a second per-token reward without
+            # the soft overlong punishment, used only for the critic's regression target. Only
+            # the v1 trainer writes it (trainer_base.py::_compute_advantage); the legacy fit
+            # loop below never does, and validate_config rejects that combination outright, so
+            # this stays absent on the v0 path rather than silently falling back.
+            if "critic_token_level_rewards" in data.batch:  # optional, v1 only
+                adv_kwargs["critic_token_level_rewards"] = data.batch["critic_token_level_rewards"]
         if "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional

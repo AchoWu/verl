@@ -150,6 +150,25 @@ class AgentLoopOutput(BaseModel):
         # Mutating a default dict does not add the field to Pydantic's fields-set,
         # so model_dump(exclude_unset=True) can omit populated extra fields.
         extra_fields = output.setdefault("extra_fields", self.extra_fields.copy())
+
+        # critic_rm_scores: JustRL-II --critic-exclude-overlong-penalty. The DAPO reward manager
+        # emits the pre-penalty score inside `reward_extra_info` (both the async reward-loop
+        # path and the colocated one nest it there), alongside the shaped `reward_score`. Lay it
+        # out exactly like rm_scores so the trainer can turn it into the critic's regression
+        # target while the actor keeps using the shaped rm_scores.
+        # Read, do not pop: _agent_loop_postprocess hands the SAME reward_extra_info dict to
+        # every output of a multi-output session (agent_loop_tq.py), and `extra_fields.copy()`
+        # above is shallow, so popping here would leave only the first output with a critic
+        # target. The key travelling on into TransferQueue is harmless.
+        reward_extra_info = extra_fields.get("reward_extra_info")
+        critic_reward_score = (
+            reward_extra_info.get("critic_reward_score") if isinstance(reward_extra_info, dict) else None
+        )
+        if critic_reward_score is not None and "rm_scores" in output:
+            critic_rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
+            critic_rm_scores[-1] = critic_reward_score
+            output["critic_rm_scores"] = critic_rm_scores
+
         teacher_ids, teacher_logprobs = (
             extra_fields.pop("teacher_ids", None),
             extra_fields.pop("teacher_logprobs", None),

@@ -128,6 +128,10 @@ class DAPORewardManager(AbstractRewardManager):
                 if self.overlong_buffer_cfg.log:
                     reward_extra_info["overlong_reward"].append(overlong_reward)
                     reward_extra_info["overlong"].append(overlong_reward < 0)
+                if self.overlong_buffer_cfg.get("exclude_from_critic", False):
+                    # JustRL-II --critic-exclude-overlong-penalty; see the reward_loop DAPO
+                    # manager for the rationale.
+                    reward_extra_info["critic_reward_score"].append(float(score))
 
             reward_tensor[i, valid_response_length - 1] = reward
 

@@ -97,11 +97,15 @@ def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
     if config.critic.enable is not None:
         return bool(config.critic.enable)
-    elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+    elif config.algorithm.adv_estimator in (
+        AdvantageEstimator.GAE,
+        AdvantageEstimator.GAE_LENGTH_ADAPTIVE,
+    ):
         return True
     else:
         warnings.warn(
-            "Disabled critic as algorithm.adv_estimator != gae. If it is not intended, please set critic.enable=True",
+            f"Disabled critic as algorithm.adv_estimator={config.algorithm.adv_estimator!r} needs no value "
+            "function. If it is not intended, please set critic.enable=True",
             stacklevel=2,
         )
         return False

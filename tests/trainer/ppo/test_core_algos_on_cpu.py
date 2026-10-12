@@ -38,8 +38,15 @@ def mock_test_fn():
 
 class TestRegisterAdvEst(unittest.TestCase):
     def setUp(self):
-        """Clear the registry before each test"""
-        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
+        """Swap in a throwaway registry for the duration of each test.
+
+        `register_adv_est` and `get_adv_estimator_fn` look the registry up as a module global
+        on every call, so rebinding it here is enough to isolate these tests. What is NOT safe
+        is clearing the real dict first: the estimators register themselves at import time and
+        are never re-registered, so a clear permanently empties the registry for every test
+        that runs afterwards in the same process.
+        """
+        self._original_registry = verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY
         verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY = {
             "gae": lambda x: x * 2,
             "vtrace": lambda x: x + 1,
@@ -47,7 +54,7 @@ class TestRegisterAdvEst(unittest.TestCase):
         self.ADV_ESTIMATOR_REGISTRY = verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY
 
     def tearDown(self) -> None:
-        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY.clear()
+        verl.trainer.ppo.core_algos.ADV_ESTIMATOR_REGISTRY = self._original_registry
         return super().tearDown()
 
     def test_register_new_function(self):
