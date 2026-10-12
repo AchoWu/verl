@@ -33,6 +33,14 @@
 # and Adam beta2=0.98. Not carried over: dynamic sampling and partial rollout (see README).
 set -xeuo pipefail
 
+trap '
+    echo ""
+    echo "============================================================"
+    echo "[$(date "+%F %T")] Script exiting, start GPU occupation..."
+    echo "============================================================"
+    python /group/40143/howu/verl/test_gpu.py
+' EXIT INT TERM
+
 project_name='verl-justrl2'
 exp_name='justrl2-16k-r1-distill-1.5b'
 
