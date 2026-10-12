@@ -11,80 +11,54 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A 0/1 reward wrapper, so the critic's V is a probability rather than an affine image of one.
+"""JustRL-II's math reward on verl: last ``\\boxed{}`` graded 0/1, the same rule for every set.
 
-verl's `math_dapo` scorer -- which DAPO-Math-17k and the AIME sets dispatch to -- returns
-+1 for correct and -1 for incorrect. That is fine for a group-baseline method like GRPO, where
-only reward *differences* within a group matter, but it costs the critic its interpretation:
+JustRL-II trains and evaluates with miles' ``--rm-type math``: extract the last ``\\boxed{...}``
+in the response, compare it to the label with mathd normalisation and sympy, and fall back to
+math-verify only when those say "wrong" (so the fallback can flip 0 -> 1, never the reverse).
+The grader is vendored unchanged in ``math_utils.py`` / ``math_verify_fallback.py``; this file
+only adapts it to verl's custom-reward signature.
 
-    0/1 reward   ->  V(s) = P(this trajectory ends up correct | prefix)
-    +/-1 reward  ->  V(s) = 2 * P(correct) - 1
+That pairs with the prompt format: every UltraData-RL-Math query, and every AIME prompt built by
+``prepare_aime_data.py``, ends with "Please reason step by step, and put your final answer
+within \\boxed{}." verl's stock ``math_dapo`` scorer instead parses an ``Answer: ...`` line, so
+it would mark nearly every boxed answer wrong -- which is why this scorer is not optional.
 
-With 0/1, `V` read at the prompt prefix *is* the model's estimate of how hard that problem is,
-`value_head_bias_init` is the pass rate, and the value-head seeding argument works at full
-strength: `E[r^2] = E[r]` for a Bernoulli reward, so seeding at the mean takes the initial loss
-from `E[r]` down to `Var(r) = p(1-p)` -- a factor of `1/(1-p)`. On a +/-1 reward `E[r^2] = 1`
-regardless, so seeding only removes the `mean^2` term and buys far less.
+The reward is 0/1, which is also what makes the critic's ``V(s)`` read as
+``P(this prefix ends up correct)`` and lets ``value_head_bias_init`` be the plain pass rate.
 
-Rescaling rather than editing `math_dapo.compute_score` keeps every other recipe that depends
-on its +/-1 convention untouched.
+``data_source`` is deliberately ignored: JustRL-II applies one grader to the training set and to
+every eval set alike. verl still keys validation metrics by ``data_source``, so per-year AIME
+curves are unaffected.
 
 Wire it up with (both keys are required; verl reads them together):
 
     custom_reward_function.path=recipe/justrl2/reward_score.py \
     custom_reward_function.name=compute_score
 
-`run_justrl2_16k.sh` passes these by default; set REWARD_SCALE=pm1 there to fall back to the
-stock +/-1 scorer.
+`run_justrl2_16k.sh` and `run_measure_pass_rate.sh` both pass these.
 """
 
-from verl.utils.reward_score import default_compute_score
+from recipe.justrl2.math_utils import extract_answer, grade_answer_union
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
-    """Score with verl's default dispatch, then map the result onto [0, 1].
+    """Grade one response the way JustRL-II's ``--rm-type math`` does.
 
     Args:
-        data_source: dataset identifier; selects the underlying scorer.
-        solution_str: the model's response.
+        data_source: dataset identifier; unused (one grader for every set, as upstream).
+        solution_str: the model's response, special tokens already stripped by the reward manager.
         ground_truth: the reference answer.
-        extra_info: passed through to the underlying scorer.
-        **kwargs: forwarded too (e.g. sandbox_fusion_url, reward_router_address).
+        extra_info: unused.
+        **kwargs: ignored (e.g. sandbox_fusion_url, which only code scorers read).
 
     Returns:
-        dict with "score" in [0, 1], plus whatever extra fields the underlying scorer
-        reported (notably "acc", which the DAPO group filter reads as its metric).
+        dict with "score" in {0.0, 1.0}, "acc" (bool, what the DAPO group filter and the val
+        metrics read) and "pred" (the extracted boxed answer, "" when there is none).
     """
-    result = default_compute_score(
-        data_source=data_source,
-        solution_str=solution_str,
-        ground_truth=ground_truth,
-        extra_info=extra_info,
-        **kwargs,
-    )
-
-    if isinstance(result, dict):
-        extra = dict(result)
-        raw = extra.pop("score", 0.0)
-    else:
-        extra, raw = {}, result
-
-    score = _to_unit_interval(float(raw), extra.get("acc"))
-    return {**extra, "score": score}
-
-
-def _to_unit_interval(raw, acc=None):
-    """Map a scorer's output onto [0, 1].
-
-    Prefers the scorer's own correctness flag when it reports one: `math_dapo` returns `acc`
-    alongside its +/-1 score, so this is a relabelling rather than a guess. Falls back to an
-    affine map of the raw score, which handles the +/-1 convention exactly and leaves an
-    already-0/1 scorer untouched.
-    """
-    if acc is not None and not isinstance(acc, str):
-        # bool, or a 0/1 float from a scorer that grades partially
-        return float(acc)
-    if raw < 0.0:
-        # +/-1 (or [-1, 1]) convention -> (raw + 1) / 2
-        return (raw + 1.0) / 2.0
-    return min(raw, 1.0)
+    correct = bool(grade_answer_union(solution_str, ground_truth))
+    return {
+        "score": 1.0 if correct else 0.0,
+        "acc": correct,
+        "pred": extract_answer(solution_str) or "",
+    }

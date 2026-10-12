@@ -11,86 +11,106 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build AIME 2024 / 2025 / 2026 validation parquets in verl's RL schema.
+"""Build AIME 2024 / 2025 / 2026 validation parquets in verl's RL schema, as JustRL-II does.
 
     python3 -m recipe.justrl2.prepare_aime_data --out-dir ~/verl/data
 
-Why this exists rather than just downloading three files:
+Mirrors JustRL-II's justrl2/prepare_eval_data.py, so the scores are comparable:
 
-1. **Per-year metrics.** verl keys validation metrics off `data_source`, and the ready-made
-   `BytedTsinghua-SIA/AIME-2024` parquet uses `math_dapo` -- the same value every other math
-   set uses. Three files all labelled `math_dapo` collapse into one blended number. This script
-   stamps `aime-2024` / `aime-2025` / `aime-2026`, which still routes to the math_dapo scorer
-   (`data_source.startswith("aime")` in verl/utils/reward_score/__init__.py) while reporting
-   `val-core/aime-2025/...` separately per year.
+1. **Same sources.** aime-2024 from the Qwen2.5-Math evaluation mirror, aime-2025 from
+   `math-ai/aime25`, aime-2026 from `math-ai/aime26` -- 30 problems each.
 
-2. **Identical prompt format.** The instruction wrapper decides how the model answers, so a
-   2025 file phrased differently from the 2024 one produces scores that cannot be compared.
-   PROMPT_TEMPLATE below is copied verbatim from BytedTsinghua-SIA/AIME-2024.
+2. **The training prompt.** `prompt = f"{problem}\\n{ANSWER_SUFFIX}"` as a single user turn with
+   no system prompt: the same instruction line every UltraData-RL-Math query ends with, so the
+   model answers in `\\boxed{}`, which recipe/justrl2/reward_score.py grades.
 
-3. **Upstream schemas differ.** aime_2026 ships (problem, answer, problem_idx); aime_2025 ships
-   (problem, answer, solution, url, ...) with the answer as a string. Both are normalised here.
+3. **Per-year metrics.** verl keys validation metrics off `data_source`, so each file is stamped
+   `aime-2024` / `aime-2025` / `aime-2026` and reports `val-core/aime-2025/...` separately. The
+   custom scorer ignores `data_source`, so this is labelling only.
 
-Each year has 30 problems. `--repeat N` writes each problem N times, which is how the
-BytedTsinghua AIME-2024 parquet reaches 960 rows: with `val_kwargs.n=1` that is how you get
-avg@N. Leave it at 1 when you set `val_kwargs.n` instead -- doing both multiplies.
+4. **Plain-integer labels.** The Qwen mirror zero-pads AIME answers ("025"); they are stored as
+   "25". The grader accepts either form; this is tidiness, not correctness.
+
+`--repeat N` writes each problem N times (avg@N with `val_kwargs.n=1`). Leave it at 1 when you
+set `val_kwargs.n` instead -- doing both multiplies.
 """
 
 import argparse
+import json
 import os
+import urllib.request
 
-import datasets
 import pandas as pd
 
-# Verbatim from BytedTsinghua-SIA/AIME-2024. Do not reword: it decides the answer format the
-# math_dapo scorer parses ("Answer: $Answer" on its own last line).
-PROMPT_TEMPLATE = (
-    "Solve the following math problem step by step. The last line of your response should be "
-    "of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
-    "{problem}\n\n"
-    'Remember to put your answer on its own line after "Answer:".'
-)
+# The instruction line every training prompt ends with (JustRL-II prepare_eval_data.ANSWER_SUFFIX).
+ANSWER_SUFFIX = "Please reason step by step, and put your final answer within \\boxed{}."
 
-# Upstream dataset -> (hf repo, config, split, problem column, answer column)
+_QWEN = "https://raw.githubusercontent.com/QwenLM/Qwen2.5-Math/main/evaluation/data/{name}/test.jsonl"
+_HF = "https://huggingface.co/datasets/{repo}/resolve/main/{path}"
+
 SOURCES = {
-    "aime-2024": ("Maxwell-Jia/AIME_2024", "default", "train", "Problem", "Answer"),
-    "aime-2025": ("yentinglin/aime_2025", "default", "train", "problem", "answer"),
-    "aime-2026": ("MathArena/aime_2026", "default", "train", "problem", "answer"),
+    "aime-2024": _QWEN.format(name="aime24"),
+    "aime-2025": _HF.format(repo="math-ai/aime25", path="test.jsonl"),
+    "aime-2026": _HF.format(repo="math-ai/aime26", path="aime2026.jsonl"),
 }
+EXPECTED_PROBLEMS = 30
+
+
+def _fetch_jsonl(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "verl-justrl2-prepare-aime"})
+    with urllib.request.urlopen(req) as resp:
+        text = resp.read().decode("utf-8")
+    return [json.loads(line) for line in text.split("\n") if line.strip()]
+
+
+def build_prompt(problem):
+    return f"{problem.strip()}\n{ANSWER_SUFFIX}"
+
+
+def normalize_label(answer):
+    label = str(answer).strip()
+    if label.isdigit():
+        label = str(int(label))
+    return label
+
+
+def to_row(name, index, item):
+    problem = str(item["problem"]).strip()
+    return {
+        "data_source": name,
+        "prompt": [{"role": "user", "content": build_prompt(problem)}],
+        "ability": "MATH",
+        "reward_model": {"style": "rule", "ground_truth": normalize_label(item["answer"])},
+        "extra_info": {"index": index, "raw_problem": problem, "split": "test"},
+    }
 
 
 def build(name, repeat):
-    repo, config, split, problem_key, answer_key = SOURCES[name]
-    print(f"[{name}] loading {repo} ({config}/{split}) ...")
-    ds = datasets.load_dataset(repo, config, split=split)
-
-    missing = [k for k in (problem_key, answer_key) if k not in ds.column_names]
+    url = SOURCES[name]
+    print(f"[{name}] fetching {url} ...")
+    raw = _fetch_jsonl(url)
+    if len(raw) != EXPECTED_PROBLEMS:
+        raise SystemExit(f"[{name}] expected {EXPECTED_PROBLEMS} problems, got {len(raw)}: the upstream file changed.")
+    missing = [k for k in ("problem", "answer") if k not in raw[0]]
     if missing:
-        raise SystemExit(
-            f"[{name}] {repo} has columns {ds.column_names}, missing {missing}. The upstream "
-            f"schema changed; update SOURCES in this file."
-        )
+        raise SystemExit(f"[{name}] rows have keys {sorted(raw[0])}, missing {missing}: the upstream schema changed.")
 
     rows = []
-    for index, item in enumerate(ds):
-        problem = str(item[problem_key]).strip()
-        # AIME answers are integers 0-999; normalise away float/str formatting ("42.0" -> "42")
-        # so string comparison in the scorer does not fail on formatting alone.
-        answer = str(item[answer_key]).strip()
-        if answer.endswith(".0"):
-            answer = answer[:-2]
-        row = {
-            "data_source": name,
-            "prompt": [{"role": "user", "content": PROMPT_TEMPLATE.format(problem=problem)}],
-            "ability": "MATH",
-            "reward_model": {"style": "rule-lighteval/MATH_v2", "ground_truth": answer},
-            "extra_info": {"index": index, "raw_problem": problem, "split": None},
-        }
-        rows.extend([row] * repeat)
-
+    for index, item in enumerate(raw):
+        rows.extend([to_row(name, index, item)] * repeat)
     df = pd.DataFrame(rows)
-    print(f"[{name}] {len(ds)} problems x {repeat} = {len(df)} rows")
+    print(f"[{name}] {len(raw)} problems x {repeat} = {len(df)} rows")
     return df
+
+
+def _is_current(path):
+    """Whether an existing parquet was built with this prompt format (earlier versions of this
+    script wrote the DAPO "Answer: $Answer" template, which the boxed grader cannot score)."""
+    try:
+        prompt = pd.read_parquet(path, columns=["prompt"])["prompt"].iloc[0]
+        return str(prompt[0]["content"]).endswith(ANSWER_SUFFIX)
+    except Exception:
+        return False
 
 
 def main():
@@ -111,9 +131,11 @@ def main():
     for name in args.years:
         path = os.path.join(args.out_dir, f"{name}.parquet")
         if os.path.exists(path) and not args.force:
-            print(f"[{name}] {path} exists, skipping (use --force to rebuild)")
-            written.append(path)
-            continue
+            if _is_current(path):
+                print(f"[{name}] {path} exists, skipping (use --force to rebuild)")
+                written.append(path)
+                continue
+            print(f"[{name}] {path} has a different prompt format (pre-boxed template?), rebuilding")
         build(name, args.repeat).to_parquet(path)
         written.append(path)
         print(f"[{name}] wrote {path}")

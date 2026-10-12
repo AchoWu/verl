@@ -25,7 +25,7 @@ onto verl's PPO pipeline.
 export MODEL_PATH=/path/to/DeepSeek-R1-Distill-Qwen-1.5B
 export RAY_DATA_HOME=/path/to/data-root
 
-# 1. fetch DAPO-Math-17k and build the AIME 2024/25/26 validation sets
+# 1. build JustRL-II's training set (UltraData-RL-2609, Math) and the AIME 2024/25/26 sets
 bash recipe/justrl2/prepare_data.sh
 
 # 2. measure the base model's mean reward -> the critic's prior (see mechanism 2)
@@ -59,13 +59,26 @@ the sequences are long enough that a uniform advantage wastes most of the signal
 
 ## The four mechanisms
 
-### 0. Reward scale: 0/1, not ±1
+### 0. Data, prompt and reward: exactly JustRL-II's
 
-verl's `math_dapo` scorer — which DAPO-Math-17k and the AIME sets dispatch to — returns **+1 /
-−1**. This recipe wraps it to **0 / 1** (`recipe/justrl2/reward_score.py`, wired in by default;
-`REWARD_SCALE=pm1` reverts). The difference is small for a group-baseline method like GRPO,
-where only within-group reward *differences* matter, but it decides what the critic's output
-means:
+The three have to match as a set, because the prompt decides the answer format and the reward
+has to parse that format.
+
+| | JustRL-II (miles) | this recipe |
+|---|---|---|
+| training set | UltraData-RL-2609, config `Math` (32,412 rows) | same, via `prepare_ultradata_math.py` |
+| system prompt | none | none |
+| user turn | raw `query`, which already ends with "Please reason step by step, and put your final answer within \boxed{}." | same |
+| chat template | the model's own, `add_generation_prompt=True` | same (verl's `RLHFDataset`) |
+| AIME eval prompt | `{problem}\n` + that same instruction; Qwen2.5-Math mirror / `math-ai/aime25` / `math-ai/aime26` | same, via `prepare_aime_data.py` |
+| reward | `--rm-type math`: last `\boxed{}`, mathd + sympy, math-verify fallback, **0/1** | the same grader vendored unchanged (`math_utils.py`, `math_verify_fallback.py`), wrapped by `reward_score.py` |
+
+verl's stock `math_dapo` scorer is not usable here: it parses an `Answer: ...` line and marks a
+correct `\boxed{10}` wrong. The chat template is the one thing that differs in practice, simply
+because the base model differs (R1-Distill-Qwen-1.5B here, MiniCPM5-2B upstream); neither side
+adds a system prompt.
+
+The 0/1 scale is what makes the critic's output meaningful:
 
 | reward | what `V(s)` is |
 |---|---|
@@ -77,9 +90,8 @@ the head at the mean takes the opening value loss from `E[r]` to `Var(r) = p(1�
 of `1/(1−p)`. On ±1, `E[r²] = 1` no matter what, so seeding only removes the `mean²` term
 (measured: 1.09× versus ~1.9×).
 
-One knob moves with the scale: the DAPO overlong penalty is *subtracted* from the reward, so
-`penalty_factor=1.0` is 100% of the span on 0/1 but only 50% on ±1. 1.0 on 0/1 matches
-JustRL-II (whose reward is also 0/1) and means a maximally-overlong correct answer scores 0.
+The DAPO overlong penalty is *subtracted* from the reward, so `penalty_factor=1.0` is 100% of
+the 0/1 span: as in JustRL-II, a maximally-overlong correct answer scores 0.
 
 ### 1. Length-adaptive λ (the core)
 
@@ -132,7 +144,7 @@ MAX_PROMPTS=300 bash recipe/justrl2/run_measure_pass_rate.sh
 ```
 
 It samples with the **training** sampling params (`temperature=1.0`, `n=8`, full response
-length) and scores with the **same scorer training uses** (the 0/1 wrapper by default), so the
+length) and scores with the **same scorer training uses** (`reward_score.py`), so the
 number is on the right scale. Both are load-bearing: a greedy decode measures something else
 entirely, and a mismatched scorer puts the bias on the wrong scale. The overlong penalty is
 deliberately not applied, because the critic's target excludes it.
@@ -154,9 +166,7 @@ Output:
     non-degenerate     : 66.7%
 ```
 
-On the 0/1 scale the mean reward *is* the pass rate, so this number is directly readable. (If
-you run with `REWARD_SCALE=pm1` the script says so and prints both figures, since the bias then
-has to be the mean reward — a negative number — rather than the pass rate.)
+On the 0/1 scale the mean reward *is* the pass rate, so this number is directly readable.
 
 The group diagnostics are a useful side-effect. Groups whose 8 samples all score the same carry
 almost no advantage signal — DAPO drops them when `filter_groups` is on, and when it is off
@@ -168,9 +178,11 @@ Train with a different scorer? Pass `CUSTOM_REWARD_PATH` so the measurement uses
 
 ### 3. Critic-only warmup
 
-`trainer.critic_warmup: 30` freezes the actor for the first 30 steps so it never updates against
-a critic that is still guessing. Combined with (2), the value head is a usable baseline from
-step 0 and a discriminating one by step 30. This is stock verl, no changes needed.
+`trainer.critic_warmup: 31` freezes the actor for the first 30 steps so it never updates against
+a critic that is still guessing. (verl's `global_steps` starts at 1 and the actor updates once
+`critic_warmup <= global_steps`, so `31` gives exactly JustRL-II's 30 critic-only rollouts; `30`
+would give 29.) Combined with (2), the value head is a usable baseline from step 0 and a
+discriminating one by step 30. This is stock verl, no changes needed.
 
 ### 4. Overlong penalty kept out of the critic's target
 
@@ -180,7 +192,7 @@ it must predict "will this be correct", and it *cannot* predict how long the res
 being — that depends on tokens not yet generated. Forcing the length term into `V` injects noise
 into the value signal.
 
-With `reward.reward_kwargs.overlong_buffer_cfg.exclude_from_critic=True` the DAPO reward manager
+With `reward_model.overlong_buffer.exclude_from_critic=True` the DAPO reward manager
 emits a second pre-penalty score, which becomes the critic's regression target. The actor's
 advantage is untouched. At 16k:
 
@@ -197,13 +209,16 @@ The critic also skips the in-reward KL penalty for the same reason.
 
 | knob | value | what it is |
 |---|---|---|
-| `custom_reward_function.path` | `recipe/justrl2/reward_score.py` | mechanism 0 — 0/1 reward |
+| `custom_reward_function.path` | `recipe/justrl2/reward_score.py` | mechanism 0 — JustRL-II's boxed 0/1 math reward |
 | `algorithm.adv_estimator` | `gae_length_adaptive` | mechanism 1 |
 | `algorithm.gamma` | `1.0` | **required**; asserted |
 | `algorithm.gae_lambda_k` | `0.5` | terminal credit reaching token 0 |
 | `critic.model.value_head_bias_init` | `0.52` | mechanism 2 — **measure yours** (see above) |
-| `trainer.critic_warmup` | `30` | mechanism 3 |
+| `trainer.critic_warmup` | `31` | mechanism 3 — 30 critic-only rollouts (verl counts from 1) |
 | `reward_model.overlong_buffer.exclude_from_critic` | `True` | mechanism 4 |
+| `algorithm.rollout_is*` | `mask`, `token`, `[0.5, 5.0]`, veto off | IcePop: JustRL-II's `--use-tis` + `icepop_function` |
+| `actor_rollout_ref.rollout.calculate_log_probs` | `True` | rollout log-probs for the IcePop ratio |
+| `*.optim.betas` | `[0.9, 0.98]` | JustRL-II's Adam beta2, actor and critic (verl default 0.999) |
 | `critic.optim.lr` | `5e-6` | 5× the actor: the critic chases a moving policy |
 | `critic.cliprange_value` | `0.2` | PPO-style value clipping |
 | `actor…clip_ratio_low/high` | `0.2` / `0.28` | clip-higher |
@@ -211,7 +226,19 @@ The critic also skips the in-reward KL penalty for the same reason.
 | `data.max_response_length` | `14336` | 16k budget |
 | `reward_model.overlong_buffer.len` | `2867` | 20% of the response budget |
 
-Everything else (DAPO group filtering, 2× over-sampling, rollout correction / TIS) is stock verl.
+### Deliberate departures from JustRL-II
+
+- **No DAPO dynamic sampling / 2× over-sampling** (`filter_groups.enable=False`). JustRL-II drops
+  zero-reward-variance groups. With critic-based advantages those groups still carry a non-zero
+  advantage, so this changes the training signal rather than only the throughput. Turn it on with
+  `algorithm.filter_groups.enable=True algorithm.filter_groups.metric=acc data.gen_batch_size=64`.
+- **No partial rollout** — verl 0.6 has no equivalent.
+- **Batch and schedule**: GBS 256 (JustRL-II 1-node 16k: 64). `trainer.total_training_steps=500`
+  matches JustRL-II's 500 rollouts and overrides `total_epochs=1`. One epoch of
+  UltraData-RL-Math is ⌊32,412 / 32⌋ = 1,012 steps (no prompt exceeds the 2048-token budget, so
+  none are filtered), so 500 steps see 16,000 prompts — about half the set. JustRL-II's 1-node
+  16k run trains on 500 × 8 = 4,000 prompts (more are generated, then dropped by dynamic
+  sampling).
 
 ### Misconfigurations fail loudly
 
@@ -221,12 +248,15 @@ hard errors rather than warnings:
 
 | condition | where |
 |---|---|
-| `gae_lambda_k` set on an estimator that ignores it | `validate_config` |
-| `gae_length_adaptive` without `gae_lambda_k`, a critic, or `gamma=1` | `validate_config` |
-| `exclude_from_critic=True` on the v0 trainer (which never plumbs it) | `validate_config` |
-| `exclude_from_critic=True` with the penalty disabled | trainer init |
-| `exclude_from_critic=True` with a reward manager that does not emit the field | trainer init |
-| `value_head_bias_init` on the megatron backend (unsupported) | megatron engine |
+| `gae_lambda_k` set on an estimator that ignores it | `validate_length_adaptive_gae_config` |
+| `gae_length_adaptive` without `gae_lambda_k`, a critic, or `gamma=1` | `validate_length_adaptive_gae_config` |
+| `exclude_from_critic=True` with the penalty disabled | `validate_length_adaptive_gae_config` |
+| `exclude_from_critic=True` with a reward manager other than `dapo` | `validate_length_adaptive_gae_config` |
+| `exclude_from_critic=True` but `critic_reward_score` missing from a batch | `attach_critic_token_level_rewards` (every step) |
+| `value_head_bias_init` on the megatron backend (unsupported) | `validate_length_adaptive_gae_config` |
+
+`validate_length_adaptive_gae_config` runs from `validate_config` under `main_ppo`, and is
+called directly from `main_dapo` (which does not call `validate_config`) before any worker starts.
 
 ## Backend support
 
@@ -234,8 +264,9 @@ hard errors rather than warnings:
 not in the policy checkpoint — HF builds it fresh, so seeding at construction is sufficient and
 there is nothing to re-apply after loading.
 
-Megatron is deliberately not wired up, and setting `value_head_bias_init` on it raises
-`NotImplementedError` rather than being ignored. Its critic loads through dist checkpoints,
+Megatron is deliberately not wired up, and setting `value_head_bias_init` with
+`critic.strategy=megatron` raises `NotImplementedError` at config validation rather than being
+ignored. Its critic loads through dist checkpoints,
 where megatron's reader fills a `[1, H]` head from the overlapping region of the `[vocab, H]`
 LM head instead of raising (`language_module.py` marks `output_layer.*` allow_shape_mismatch
 for vocab padding). Construction-time seeding would be silently overwritten, so that path needs
@@ -248,8 +279,7 @@ upstream, and what would have to be ported and verified before trusting a megatr
 pytest tests/trainer/ppo/test_length_adaptive_gae_on_cpu.py \
        tests/utils/test_value_head_seeding_on_cpu.py \
        tests/utils/test_config_length_adaptive_gae_on_cpu.py \
-       tests/utils/test_justrl2_reward_score_on_cpu.py \
-       tests/experimental/agent_loop/test_critic_rm_scores_on_cpu.py -q
+       tests/utils/test_justrl2_reward_score_on_cpu.py -q
 ```
 
 Covers the `λ^L = k` invariant across lengths and `k` values; **bf16 inputs producing the same
@@ -257,34 +287,43 @@ result as fp32** (the regression that silently disabled mechanism 1); returns be
 of `values` (i.e. genuinely λ=1 rather than `advantages + values`); the critic reward override
 affecting only returns; advantage whitening; the γ≠1 and missing-`k` guards; both value-head
 layouts (`score` and TRL's `v_head.summary`); bias creation when the head was built without one;
-that gradients still flow through a zeroed weight; the ±1→0/1 rescaling (including that `acc`
-survives for the group filter); and every config guard in the table above. (The
-multi-output `reward_extra_info` aliasing test is v1-only and does not apply here.)
+that gradients still flow through a zeroed weight; the boxed grader (equivalent forms, last box
+wins, unboxed and truncated answers score 0, one rule for every `data_source`, the math-verify
+fallback on Linux) and the prompt rows (raw query as one user turn, AIME suffix, stale-parquet
+detection); every config guard in the table above; the critic config
+instantiating through hydra with `value_head_bias_init` set or null; the recipe yaml clearing
+validation; the DAPO trainer forwarding `config` to `compute_advantage`; and the critic target
+landing on the shaped reward's token. (The multi-output `reward_extra_info` aliasing test is
+v1-only and does not apply here.)
 
 ## Files
 
 | file | change |
 |---|---|
 | `verl/trainer/ppo/core_algos.py` | `length_adaptive_lambda`, `compute_length_adaptive_gae_advantage_return`, enum entry |
-| `verl/trainer/ppo/ray_trainer.py` | pass `values` / `gamma` / `lam` / `critic_token_level_rewards` to registry estimators |
+| `verl/trainer/ppo/ray_trainer.py` | pass `values` / `gamma` / `lam` / `critic_token_level_rewards` to registry estimators; `attach_critic_token_level_rewards`, `critic_excludes_overlong_penalty` |
 | `verl/trainer/ppo/utils.py` | `need_critic` recognizes the new estimator |
-| `verl/utils/config.py` | `_validate_length_adaptive_gae_config` guards |
+| `verl/utils/config.py` | `validate_length_adaptive_gae_config` guards |
 | `verl/trainer/config/algorithm.py` | `AlgoConfig.gae_lambda_k` |
+| `verl/trainer/config/config.py` | `BaseModelConfig.value_head_bias_init` (critic model dataclass) |
+| `verl/trainer/config/critic/critic.yaml` | `model.value_head_bias_init: null` |
 | `verl/utils/model.py` | `find_scalar_value_head`, `seed_scalar_value_head` |
-| `verl/workers/config/model.py` | `HFModelConfig.value_head_bias_init` |
 | `verl/workers/fsdp_workers.py` | seed the head after `load_valuehead_model` |
 | `verl/workers/reward_manager/dapo.py` | emit `critic_reward_score` |
-| `recipe/dapo/dapo_ray_trainer.py` | call `attach_critic_token_level_rewards` in its own fit() |
+| `recipe/dapo/dapo_ray_trainer.py` | call `attach_critic_token_level_rewards` in its own fit(); pass `config` to `compute_advantage` |
+| `recipe/dapo/main_dapo.py` | run `validate_length_adaptive_gae_config` before workers start |
 
 Recipe-local:
 
 | file | what |
 |---|---|
 | `run_justrl2_16k.sh` | the 16k training run |
-| `config/justrl2_trainer.yaml` | recipe defaults (estimator, `reward_kwargs`) |
-| `reward_score.py` | 0/1 reward wrapper (`REWARD_SCALE=pm1` to skip) |
-| `prepare_data.sh` | fetch DAPO-Math-17k, build the AIME sets |
-| `prepare_aime_data.py` | AIME 2024/25/26 → verl schema, per-year `data_source` |
+| `config/justrl2_trainer.yaml` | recipe defaults (estimator, `reward_model.overlong_buffer`) |
+| `reward_score.py` | JustRL-II's `--rm-type math` reward on verl's custom-reward signature, 0/1 |
+| `math_utils.py`, `math_verify_fallback.py` | that grader, vendored from JustRL-II's miles unchanged (one import line) |
+| `prepare_data.sh` | build the UltraData-RL-Math training set and the AIME sets |
+| `prepare_ultradata_math.py` | UltraData-RL-2609 (Math) → verl schema, raw query as one user turn |
+| `prepare_aime_data.py` | AIME 2024/25/26 from JustRL-II's sources, its prompt, per-year `data_source` |
 | `measure_pass_rate.py` | score generations → `value_head_bias_init` |
 | `run_measure_pass_rate.sh` | generate + score in one go |
 

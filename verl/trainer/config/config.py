@@ -68,6 +68,8 @@ class BaseModelConfig(BaseConfig):
         override_config (dict): Hugging Face config override.
         external_lib (Optional[str]): External model implementation (optional).
         trust_remote_code (bool): Whether to trust remote code from Hugging Face models.
+        value_head_bias_init (Optional[float]): JustRL-II critic value-head seeding: zero the
+            scalar head's weight and fill its bias with this value. None keeps the HF init.
     """
 
     path: str = "~/models/deepseek-llm-7b-chat"
@@ -75,3 +77,6 @@ class BaseModelConfig(BaseConfig):
     override_config: dict[str, Any] = field(default_factory=dict)
     external_lib: Optional[str] = None
     trust_remote_code: bool = False
+    # Declared here because critic.yaml carries the key for every critic: without a field,
+    # hydra's instantiate of critic.model raises TypeError at init_workers, even when null.
+    value_head_bias_init: Optional[float] = None

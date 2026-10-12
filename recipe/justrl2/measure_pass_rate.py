@@ -18,10 +18,10 @@ with a zero-initialized head V == bias for every token at step 0 and the value l
 at Var(r) instead of E[r^2]. See recipe/justrl2/README.md section 2.
 
 Note this is the mean *reward*, not the pass rate -- the two differ whenever the scorer is not
-0/1. verl's `math_dapo` scorer (what DAPO-Math-17k and the AIME sets dispatch to) returns
-+1 / -1, so a 40% pass rate means E[r] = -0.2 and the bias belongs at -0.2, not 0.4. This
-script reports whatever the configured scorer actually produces, so just use the number it
-prints. JustRL-II's published 0.52 comes from a 0/1 scorer and does not transfer to a +/-1 one.
+0/1. This recipe's scorer (recipe/justrl2/reward_score.py, JustRL-II's boxed math grader) is
+0/1, so here they coincide; with a +/-1 scorer a 40% pass rate would mean E[r] = -0.2 and the
+bias would belong at -0.2. This script reports whatever the configured scorer actually
+produces, so just use the number it prints.
 
 That makes the sampling config part of the measurement, not a detail: a greedy (temperature=0)
 accuracy is the wrong number. This script samples with the same temperature / top_p / n as
@@ -45,9 +45,9 @@ training and reports the mean over all samples.
 
 Or run both in one go with `bash recipe/justrl2/run_measure_pass_rate.sh`.
 
-Scoring reuses verl's own `default_compute_score` (dispatched on `data_source`), so the number
-matches what the reward manager will produce during training. Pass `--custom-reward-path` to
-use the same custom scorer you train with.
+Scoring defaults to the recipe's own scorer (recipe/justrl2/reward_score.py), the one training
+uses, so the number matches what the reward manager will produce. `--custom-reward-path ""`
+falls back to verl's `default_compute_score` (dispatched on `data_source`).
 
 NOTE the overlong penalty is deliberately NOT applied here: the critic's regression target
 excludes it (`exclude_from_critic=True`), so the bias must match the unshaped reward.
@@ -64,6 +64,8 @@ import numpy as np
 import pandas as pd
 
 _SCORER = None
+# The scorer run_justrl2_16k.sh trains with.
+_RECIPE_SCORER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reward_score.py")
 
 
 def _init_scorer(custom_path, custom_name):
@@ -125,7 +127,11 @@ def main():
     parser.add_argument("--reward-model-key", default="reward_model")
     parser.add_argument("--extra-info-key", default="extra_info")
     parser.add_argument("--num-workers", type=int, default=max(1, (os.cpu_count() or 4) // 2))
-    parser.add_argument("--custom-reward-path", default=None, help="Use the custom scorer you train with")
+    parser.add_argument(
+        "--custom-reward-path",
+        default=_RECIPE_SCORER,
+        help="Scorer file; defaults to the recipe's training scorer. Empty = verl's default_compute_score",
+    )
     parser.add_argument("--custom-reward-name", default="compute_score")
     parser.add_argument("--max-prompts", type=int, default=-1, help="Score only the first N prompts (a quick look)")
     parser.add_argument("--output-json", default=None, help="Also write the metrics here")

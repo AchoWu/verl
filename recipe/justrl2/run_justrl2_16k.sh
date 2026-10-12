@@ -24,11 +24,13 @@
 # length as its input, so the same k acts on a different length distribution.
 #
 # The mechanisms and where they live:
-#   0. 0/1 reward scale           custom_reward_function (REWARD_SCALE)
+#   0. 0/1 boxed math reward      custom_reward_function (JustRL-II's --rm-type math)
 #   1. length-adaptive GAE        algorithm.adv_estimator + algorithm.gae_lambda_k
 #   2. value-head seeding         critic.model.value_head_bias_init
 #   3. critic-only warmup         trainer.critic_warmup
 #   4. penalty kept out of critic reward_model.overlong_buffer.exclude_from_critic
+# Also carried over from JustRL-II's run config: IcePop rollout correction (algorithm.rollout_is*)
+# and Adam beta2=0.98. Not carried over: dynamic sampling and partial rollout (see README).
 set -xeuo pipefail
 
 project_name='verl-justrl2'
@@ -38,7 +40,9 @@ exp_name='justrl2-16k-r1-distill-1.5b'
 adv_estimator=gae_length_adaptive
 gamma=1.0                       # must be 1: the decoupled returns are the suffix reward sum
 gae_lambda_k=0.5                # fraction of terminal credit reaching the first token
-critic_warmup=30                # rollouts where only the critic is updated
+critic_warmup=31                # 30 critic-only rollouts, as JustRL-II: verl's global_steps
+                                # starts at 1 and updates the actor once critic_warmup <= step,
+                                # so steps 1..30 are critic-only and the actor first moves at 31
 # The critic's prior: E[r] under the training sampling params. On this recipe's 0/1 reward
 # scale that is just the base model's pass rate, and V(s) reads as "probability this prefix
 # ends up correct". 0.52 is JustRL-II's number for THEIR model and data -- measure yours with
@@ -69,6 +73,13 @@ use_kl_loss=False
 kl_loss_coef=0.0
 entropy_coeff=0.0
 loss_agg_mode="token-mean"
+# JustRL-II's optimizer: beta2=0.98 (verl defaults to 0.999), shared by actor and critic.
+adam_betas="[0.9,0.98]"
+# IcePop (JustRL-II --use-tis with icepop_function): token-level importance weight
+# pi_train / pi_rollout, kept as-is inside [0.5, 5.0] and zeroed outside. verl's masked IS is the
+# same rule; its per-sequence veto has no JustRL-II counterpart and is turned off.
+rollout_is_threshold=5.0
+rollout_is_threshold_lower=0.5
 
 # ---- rollout / batching -----------------------------------------------------------------
 # GBS = 32 * 8 = 256. JustRL-II's release recipe is 60 * 8 = 480 on 16 nodes; its 1-node 16k
@@ -102,7 +113,11 @@ infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 critic_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2 / sp_size))
 
 # ---- schedule ---------------------------------------------------------------------------
-total_epochs=${TOTAL_EPOCHS:-3}
+# 500 steps, as JustRL-II's NUM_ROLLOUT. total_training_steps overrides the epoch count, so
+# total_epochs=1 only matters if you drop it: one epoch of UltraData-RL-Math is
+# floor(32412 / 32) = 1012 steps, so 500 steps covers 16,000 prompts, about half of it.
+total_epochs=${TOTAL_EPOCHS:-1}
+total_training_steps=${TOTAL_TRAINING_STEPS:-500}
 save_freq=${SAVE_FREQ:-25}
 # Aligned with save_freq so every checkpoint has a matching eval point.
 test_freq=${TEST_FREQ:-25}
@@ -118,9 +133,11 @@ MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/llms/DeepSeek-R1-Distill-Qwen-1.5B"}
 # The critic starts from the same base weights; HF builds its scalar head fresh.
 CRITIC_MODEL_PATH=${CRITIC_MODEL_PATH:-"${MODEL_PATH}"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-# Validation suite: three AIME years. verl keys val metrics by `data_source`, so each file
-# reports its own score; anything starting with "aime" dispatches to the math_dapo scorer.
+# JustRL-II's training set, built by prepare_data.sh: UltraData-RL-2609 (Math), raw query as a
+# single user turn with no system prompt.
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/ultradata-rl-math.parquet"}
+# Validation suite: three AIME years, JustRL-II's sources and prompt. verl keys val metrics by
+# `data_source`, so each file reports its own score.
 AIME24_FILE=${AIME24_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 AIME25_FILE=${AIME25_FILE:-"${RAY_DATA_HOME}/data/aime-2025.parquet"}
 AIME26_FILE=${AIME26_FILE:-"${RAY_DATA_HOME}/data/aime-2026.parquet"}
@@ -131,19 +148,11 @@ TEST_FILES=${TEST_FILES:-"['${AIME24_FILE}','${AIME25_FILE}','${AIME26_FILE}']"}
 # `wandb login`, before starting. LOGGER='["console"]' turns wandb off.
 LOGGER=${LOGGER:-'["console","wandb"]'}
 
-# ---- reward scale -------------------------------------------------------------------------
-# 0/1 instead of math_dapo's native +/-1, so the critic's V(s) reads as "probability this
-# prefix ends up correct" -- at the prompt that is a difficulty estimate, and the value-head
-# seeding argument works at full strength (E[r^2] = E[r] for a Bernoulli reward, versus
-# E[r^2] = 1 regardless on +/-1). REWARD_SCALE=pm1 reverts to the stock scorer.
-REWARD_SCALE=${REWARD_SCALE:-unit}
-reward_fn_args=()
-if [ "${REWARD_SCALE}" = "unit" ]; then
-    reward_fn_args=(
-        custom_reward_function.path="${WORKING_DIR}/recipe/justrl2/reward_score.py"
-        custom_reward_function.name=compute_score
-    )
-fi
+# ---- reward -------------------------------------------------------------------------------
+# JustRL-II's `--rm-type math`: last \boxed{} graded 0/1 (mathd + sympy, math-verify fallback),
+# one grader for train and eval. Not optional: every prompt asks for \boxed{}, and verl's stock
+# math_dapo scorer parses an "Answer:" line instead, so it would mark correct answers wrong.
+REWARD_FN_PATH=${REWARD_FN_PATH:-"${WORKING_DIR}/recipe/justrl2/reward_score.py"}
 
 # ---- launch ------------------------------------------------------------------------------
 SUBMIT=${SUBMIT:-0}
@@ -174,11 +183,18 @@ ${launcher[@]+"${launcher[@]}"} python3 -m recipe.dapo.main_dapo \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
+    algorithm.rollout_is=True \
+    algorithm.rollout_is_threshold=${rollout_is_threshold} \
+    algorithm.rollout_is_threshold_lower=${rollout_is_threshold_lower} \
+    algorithm.rollout_is_mode=mask \
+    algorithm.rollout_is_level=token \
+    algorithm.rollout_is_veto_threshold=null \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
+    actor_rollout_ref.actor.optim.betas="${adam_betas}" \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -198,6 +214,7 @@ ${launcher[@]+"${launcher[@]}"} python3 -m recipe.dapo.main_dapo \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
@@ -223,6 +240,7 @@ ${launcher[@]+"${launcher[@]}"} python3 -m recipe.dapo.main_dapo \
     critic.optim.lr=${critic_lr} \
     critic.optim.lr_warmup_steps=${critic_lr_warmup_steps} \
     critic.optim.weight_decay=0.1 \
+    critic.optim.betas="${adam_betas}" \
     critic.cliprange_value=${cliprange_value} \
     critic.loss_agg_mode=${loss_agg_mode} \
     critic.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -237,7 +255,8 @@ ${launcher[@]+"${launcher[@]}"} python3 -m recipe.dapo.main_dapo \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
     reward_model.overlong_buffer.log=True \
     reward_model.overlong_buffer.exclude_from_critic=${exclude_overlong_from_critic} \
-    ${reward_fn_args[@]+"${reward_fn_args[@]}"} \
+    custom_reward_function.path="${REWARD_FN_PATH}" \
+    custom_reward_function.name=compute_score \
     trainer.critic_warmup=${critic_warmup} \
     trainer.logger="${LOGGER}" \
     trainer.project_name="${project_name}" \
@@ -248,5 +267,6 @@ ${launcher[@]+"${launcher[@]}"} python3 -m recipe.dapo.main_dapo \
     trainer.save_freq=${save_freq} \
     trainer.test_freq=${test_freq} \
     trainer.total_epochs=${total_epochs} \
+    trainer.total_training_steps=${total_training_steps} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto "$@"

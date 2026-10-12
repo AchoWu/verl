@@ -41,6 +41,7 @@ from verl.trainer.ppo.ray_trainer import (
     attach_critic_token_level_rewards,
     compute_advantage,
     compute_response_mask,
+    critic_excludes_overlong_penalty,
 )
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
@@ -196,7 +197,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                         # JustRL-II: the critic's de-shaped target, built here (not in the base
                         # trainer) because this loop overrides fit() wholesale.
-                        attach_critic_token_level_rewards(new_batch)
+                        attach_critic_token_level_rewards(
+                            new_batch, required=critic_excludes_overlong_penalty(self.config)
+                        )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -324,6 +327,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
                         )
 
                     # update critic

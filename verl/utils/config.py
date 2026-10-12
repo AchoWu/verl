@@ -71,13 +71,38 @@ def update_dict_with_config(dictionary: dict, config: DictConfig):
             dictionary[key] = getattr(config, key)
 
 
-def _validate_length_adaptive_gae_config(config: DictConfig, use_critic: bool) -> None:
+def validate_length_adaptive_gae_config(config: DictConfig, use_critic: bool) -> None:
     """Preconditions for the JustRL-II length-adaptive decoupled GAE estimator.
 
     Each of these is a silent-failure mode rather than a crash, which is why they are hard
     errors: the estimator would quietly degrade into ordinary GAE (or regress the critic
     against the wrong reward) while every metric still looks healthy.
+
+    The two critic-side knobs (value-head seeding, de-shaped critic target) are checked first,
+    independent of the estimator.
     """
+    if (
+        OmegaConf.select(config, "critic.model.value_head_bias_init") is not None
+        and OmegaConf.select(config, "critic.strategy") == "megatron"
+    ):
+        raise NotImplementedError(
+            "critic.model.value_head_bias_init is only wired into the FSDP critic. On megatron it "
+            "would be silently ignored (and the dist-ckpt reader overwrites a construction-time "
+            "seed anyway). Use critic.strategy=fsdp, or drop value_head_bias_init."
+        )
+    if OmegaConf.select(config, "reward_model.overlong_buffer.exclude_from_critic", default=False):
+        if not OmegaConf.select(config, "reward_model.overlong_buffer.enable", default=False):
+            raise ValueError(
+                "reward_model.overlong_buffer.exclude_from_critic=True but the overlong penalty is "
+                "disabled, so there is nothing to exclude. Set reward_model.overlong_buffer.enable=True, "
+                "or drop exclude_from_critic."
+            )
+        if OmegaConf.select(config, "reward_model.reward_manager") != "dapo":
+            raise ValueError(
+                "reward_model.overlong_buffer.exclude_from_critic=True needs reward_model.reward_manager=dapo: "
+                "only the DAPO reward manager emits the pre-penalty score the critic regresses."
+            )
+
     if config.algorithm.adv_estimator != "gae_length_adaptive":
         if config.algorithm.get("gae_lambda_k") is not None:
             raise ValueError(
@@ -119,7 +144,7 @@ def validate_config(
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
-    _validate_length_adaptive_gae_config(config, use_critic)
+    validate_length_adaptive_gae_config(config, use_critic)
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":

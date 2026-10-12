@@ -341,6 +341,7 @@ critic:
     override_config: {}
     external_lib: ${oc.select:actor_rollout_ref.model.external_lib,null}
     trust_remote_code: ${oc.select:actor_rollout_ref.model.trust_remote_code,false}
+    value_head_bias_init: null
     _target_: verl.workers.config.FSDPCriticModelCfg
     use_shm: false
     enable_gradient_checkpointing: true
@@ -450,6 +451,7 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  gae_lambda_k: null
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: false
   kl_penalty: kl

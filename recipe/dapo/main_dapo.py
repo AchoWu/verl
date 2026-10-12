@@ -80,6 +80,13 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
+        # main_ppo runs these through validate_config; this entry point does not call it, so the
+        # length-adaptive GAE guards must be invoked here to fail before any worker starts.
+        from verl.trainer.ppo.utils import need_critic
+        from verl.utils.config import validate_length_adaptive_gae_config
+
+        validate_length_adaptive_gae_config(config, use_critic=need_critic(config))
+
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
 

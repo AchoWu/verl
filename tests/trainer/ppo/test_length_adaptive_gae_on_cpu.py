@@ -355,3 +355,98 @@ class TestLengthAdaptiveGAE:
         )
         assert advantages.shape == rewards.shape
         assert returns.shape == rewards.shape
+
+
+def _data_proto(lengths, scores, critic_scores=None, prompt_len=4, width=None):
+    """A minimal post-reward DataProto: right-padded responses, shaped score on the last token."""
+    import numpy as np
+
+    from verl import DataProto
+
+    width = width or max(lengths)
+    bs = len(lengths)
+    attention_mask = torch.zeros(bs, prompt_len + width, dtype=torch.long)
+    attention_mask[:, :prompt_len] = 1
+    token_level_scores = torch.zeros(bs, width)
+    for i, (length, score) in enumerate(zip(lengths, scores, strict=True)):
+        attention_mask[i, prompt_len : prompt_len + length] = 1
+        token_level_scores[i, length - 1] = score
+    tensors = {
+        "prompts": torch.zeros(bs, prompt_len, dtype=torch.long),
+        "responses": torch.zeros(bs, width, dtype=torch.long),
+        "attention_mask": attention_mask,
+        "token_level_scores": token_level_scores,
+        "token_level_rewards": token_level_scores.clone(),
+        "values": torch.zeros(bs, width),
+    }
+    non_tensors = {"uid": np.array([str(i) for i in range(bs)], dtype=object)}
+    if critic_scores is not None:
+        non_tensors["critic_reward_score"] = np.array(critic_scores, dtype=np.float32)
+    return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors)
+
+
+class TestTrainerWiring:
+    """The trainer-side plumbing: config reaching the estimator, the critic's de-shaped target."""
+
+    def test_compute_advantage_requires_the_algorithm_config(self):
+        """Without `config` the estimator cannot see gae_lambda_k and raises -- which is what the
+        DAPO trainer did on its first step before it started passing `config`."""
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.ray_trainer import compute_advantage
+
+        with pytest.raises(ValueError, match="requires algorithm.gae_lambda_k"):
+            compute_advantage(_data_proto([3, 5], [1.0, 0.0]), adv_estimator="gae_length_adaptive")
+
+        data = compute_advantage(
+            _data_proto([3, 5], [1.0, 0.0]),
+            adv_estimator="gae_length_adaptive",
+            config=OmegaConf.create({"gae_lambda_k": 0.5}),
+        )
+        assert data.batch["advantages"].shape == data.batch["token_level_rewards"].shape
+
+    def test_dapo_trainer_passes_the_algorithm_config(self):
+        """RayDAPOTrainer.fit overrides the base loop wholesale, so its compute_advantage call
+        must forward `config` itself; the base trainer passing it does not help."""
+        import inspect
+
+        from recipe.dapo.dapo_ray_trainer import RayDAPOTrainer
+
+        assert "config=self.config.algorithm" in inspect.getsource(RayDAPOTrainer.fit)
+
+    def test_attach_places_the_critic_score_on_the_last_response_token(self):
+        from verl.trainer.ppo.ray_trainer import attach_critic_token_level_rewards
+
+        data = _data_proto([3, 5], [0.7, -0.2], critic_scores=[1.0, 0.0])
+        attach_critic_token_level_rewards(data, required=True)
+        critic = data.batch["critic_token_level_rewards"]
+        assert critic[0, 2] == 1.0 and critic[1, 4] == 0.0
+        # Same token as the shaped reward, and nothing anywhere else.
+        assert torch.equal(critic != 0, torch.tensor([[0, 0, 1, 0, 0], [0, 0, 0, 0, 0]], dtype=torch.bool))
+
+    def test_attach_is_a_noop_without_the_field_unless_required(self):
+        from verl.trainer.ppo.ray_trainer import attach_critic_token_level_rewards
+
+        data = _data_proto([3, 5], [1.0, 0.0])
+        attach_critic_token_level_rewards(data)
+        assert "critic_token_level_rewards" not in data.batch.keys()
+        with pytest.raises(RuntimeError, match="did not emit 'critic_reward_score'"):
+            attach_critic_token_level_rewards(data, required=True)
+
+    @pytest.mark.parametrize(
+        "overlong_buffer, expected",
+        [
+            (None, False),
+            ({"enable": True, "exclude_from_critic": True}, True),
+            ({"enable": False, "exclude_from_critic": True}, False),
+            ({"enable": True, "exclude_from_critic": False}, False),
+            ({"enable": True}, False),
+        ],
+    )
+    def test_critic_excludes_overlong_penalty(self, overlong_buffer, expected):
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.ray_trainer import critic_excludes_overlong_penalty
+
+        reward_model = {} if overlong_buffer is None else {"overlong_buffer": overlong_buffer}
+        assert critic_excludes_overlong_penalty(OmegaConf.create({"reward_model": reward_model})) is expected

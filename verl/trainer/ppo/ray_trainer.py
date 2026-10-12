@@ -161,7 +161,19 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def attach_critic_token_level_rewards(data: DataProto) -> None:
+def critic_excludes_overlong_penalty(config) -> bool:
+    """Whether the config asks for the critic to regress the reward WITHOUT the overlong penalty.
+
+    Only meaningful when the penalty itself is on; ``reward_model.overlong_buffer`` exists only in
+    configs that use the DAPO reward manager, so its absence means False.
+    """
+    overlong_cfg = config.reward_model.get("overlong_buffer", None)
+    if overlong_cfg is None:
+        return False
+    return bool(overlong_cfg.get("enable", False) and overlong_cfg.get("exclude_from_critic", False))
+
+
+def attach_critic_token_level_rewards(data: DataProto, required: bool = False) -> None:
     """JustRL-II --critic-exclude-overlong-penalty: build the critic's de-shaped reward.
 
     The DAPO reward manager emits a second, pre-penalty score per sample alongside the shaped
@@ -169,8 +181,9 @@ def attach_critic_token_level_rewards(data: DataProto) -> None:
     correct" rather than a mixture of correctness and length -- which it cannot predict
     mid-generation anyway. The actor's advantage keeps using the fully shaped reward.
 
-    No-op when the reward manager did not emit the field, so this is safe to call
-    unconditionally.
+    No-op when the reward manager did not emit the field, unless ``required``: then a missing
+    field is an error, because the critic would otherwise silently regress the shaped reward
+    (e.g. when the trainer's reward_fn fallback path drops ``reward_extra_info``).
 
     The write index is derived from ``attention_mask`` rather than ``response_mask``: that is
     what the reward manager itself uses to place the shaped reward, so the two land on the same
@@ -181,6 +194,12 @@ def attach_critic_token_level_rewards(data: DataProto) -> None:
     is not part of the critic's target.
     """
     if "critic_reward_score" not in data.non_tensor_batch:
+        if required:
+            raise RuntimeError(
+                "reward_model.overlong_buffer.exclude_from_critic is set but the reward manager did "
+                "not emit 'critic_reward_score'; the critic would regress the overlong-penalized "
+                "reward. Check that reward_model.reward_manager=dapo and that reward_fn succeeded."
+            )
         return
 
     token_level_scores = data.batch["token_level_scores"]
@@ -1194,7 +1213,7 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        attach_critic_token_level_rewards(batch)
+                        attach_critic_token_level_rewards(batch, required=critic_excludes_overlong_penalty(self.config))
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
