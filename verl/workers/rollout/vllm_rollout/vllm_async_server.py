@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pickle
+from concurrent.futures import Future
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -86,7 +87,14 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
+        non_block: bool = False,
     ) -> list[Any]:
+        """Run ``method`` on every worker and return their outputs.
+
+        ``non_block`` is passed by vLLM >= 0.11 (``Executor.execute_model`` / ``sample_tokens``),
+        which then takes ``output[0]`` as a ``Future``. The ZeroMQ round trip is synchronous, so
+        with ``non_block=True`` the outputs come back wrapped in already-completed futures.
+        """
         if isinstance(method, str):
             sent_method = method
         else:
@@ -100,6 +108,13 @@ class ExternalZeroMQDistributedExecutor(Executor):
         outputs = []
         for socket in self.sockets:
             outputs.append(pickle.loads(socket.recv()))
+        if non_block:
+            futures = []
+            for output in outputs:
+                future = Future()
+                future.set_result(output)
+                futures.append(future)
+            return futures
         return outputs
 
     def check_health(self):
