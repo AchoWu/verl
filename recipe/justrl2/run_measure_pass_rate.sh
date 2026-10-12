@@ -81,16 +81,15 @@ PY
 )
     echo "generating for ${n_prompts} prompts x ${N_SAMPLES} samples -> ${GEN_OUTPUT}"
 
-    # main_generation_server fires every request at once, one HTTP connection each, so it needs
-    # one file descriptor per request (the default soft limit of 1024 is what raised
-    # "Too many open files"). Raise the soft limit for this shell and its children (the Ray
-    # cluster ray.init starts below); stop any already-running cluster first, since its vLLM
-    # servers would keep their old limit.
-    fds_needed=$(( n_prompts * N_SAMPLES + 4096 ))
+    # main_generation_server keeps up to VERL_GEN_MAX_CONNECTIONS (default 256) connections open
+    # per replica, so the client needs about replicas x 256 file descriptors on top of its own.
+    # Raise the soft limit for this shell and its children (the Ray cluster ray.init starts
+    # below); stop any already-running cluster first, since its processes keep their old limit.
+    fds_needed=$(( NNODES * NGPUS_PER_NODE / ROLLOUT_TP * ${VERL_GEN_MAX_CONNECTIONS:-256} + 4096 ))
     fds_hard=$(ulimit -Hn)
     if [ "${fds_hard}" != "unlimited" ] && [ "${fds_hard}" -lt "${fds_needed}" ]; then
-        echo "FATAL: need ~${fds_needed} open files for ${n_prompts} x ${N_SAMPLES} requests, but the hard" \
-             "limit is ${fds_hard}. Lower MAX_PROMPTS or raise the hard limit (ulimit -Hn)." >&2
+        echo "FATAL: need ~${fds_needed} open files, but the hard limit is ${fds_hard}. Lower" \
+             "VERL_GEN_MAX_CONNECTIONS or raise the hard limit (ulimit -Hn)." >&2
         exit 1
     fi
     if [ "$(ulimit -Sn)" != "unlimited" ] && [ "$(ulimit -Sn)" -lt "${fds_needed}" ]; then

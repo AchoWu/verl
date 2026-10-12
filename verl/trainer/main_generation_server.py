@@ -63,20 +63,31 @@ async def start_server(config):
     return server_handles, server_addresses
 
 
-async def submit_request(server_address, **chat_complete_request):
-    try:
-        extra_headers = chat_complete_request.pop("extra_headers", {})
-        timeout = aiohttp.ClientTimeout(total=None)
-        session = aiohttp.ClientSession(timeout=timeout)
-        async with session.post(
-            url=f"http://{server_address}/v1/chat/completions",
-            headers={"Authorization": "Bearer token-abc123", **extra_headers},
-            json=chat_complete_request,
-        ) as resp:
-            data = await resp.json()
-            return ChatCompletion(**data)
-    finally:
-        await session.close()
+# Concurrent HTTP connections per replica. vLLM batches internally (up to max_num_seqs), so more
+# connections than that only queue in the server. Opening one fresh connection per request, all at
+# once, is what failed before: thousands of requests exhaust the fd limit ("Too many open files"),
+# and hundreds of simultaneous connects per server can overflow its accept queue (refused).
+MAX_CONNECTIONS_PER_REPLICA = int(os.environ.get("VERL_GEN_MAX_CONNECTIONS", "256"))
+CONNECT_RETRIES = 5
+
+
+async def submit_request(session: aiohttp.ClientSession, server_address, **chat_complete_request):
+    extra_headers = chat_complete_request.pop("extra_headers", {})
+    for attempt in range(CONNECT_RETRIES):
+        try:
+            async with session.post(
+                url=f"http://{server_address}/v1/chat/completions",
+                headers={"Authorization": "Bearer token-abc123", **extra_headers},
+                json=chat_complete_request,
+            ) as resp:
+                data = await resp.json()
+                return ChatCompletion(**data)
+        except aiohttp.ClientConnectorError:
+            # Only failures to *connect* are retried: the request never reached the server, so
+            # resending cannot duplicate a generation. A server that is really down still fails.
+            if attempt == CONNECT_RETRIES - 1:
+                raise
+            await asyncio.sleep(2**attempt)
 
 
 async def generate_per_replica(server_address, model_path: str, n_samples: int, sampling_params: dict, chat_lst: list):
@@ -98,8 +109,12 @@ async def generate_per_replica(server_address, model_path: str, n_samples: int, 
         for _ in range(n_samples)
     ]
 
-    tasks = [submit_request(server_address, **req) for req in chat_complete_request]
-    results = await asyncio.gather(*tasks)
+    # One pooled session per replica: connections are reused, and the connector limit caps how many
+    # are open at once (the remaining requests wait for a free connection).
+    connector = aiohttp.TCPConnector(limit=MAX_CONNECTIONS_PER_REPLICA)
+    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None)) as session:
+        tasks = [submit_request(session, server_address, **req) for req in chat_complete_request]
+        results = await asyncio.gather(*tasks)
     return results
 
 
