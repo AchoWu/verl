@@ -20,6 +20,13 @@
 # the bias needs. Do not shorten RESPONSE_LENGTH instead: that truncates answers and understates
 # the pass rate. MAX_PROMPTS=-1 generates for the whole training set (32,412 x 8 requests).
 set -xeuo pipefail
+trap '
+    echo ""
+    echo "============================================================"
+    echo "[$(date "+%F %T")] Script exiting, start GPU occupation..."
+    echo "============================================================"
+    python /group/40143/howu/verl/test_gpu.py
+' EXIT INT TERM
 
 # Import verl and recipe/ from THIS checkout (run from the repo root), ahead of any other
 # `pip install -e` of verl in the env; see run_justrl2_16k.sh.
