@@ -125,6 +125,15 @@ test_freq=${TEST_FREQ:-50}
 # ---- Ray / paths ------------------------------------------------------------------------
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
+# Import verl and recipe/ from THIS checkout, ahead of any other `pip install -e` of verl in the
+# env: otherwise the driver and every Ray worker (which inherit this env) silently run another
+# copy of the code. Fail now if it still resolves elsewhere, rather than at the first step.
+export PYTHONPATH="${WORKING_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+verl_dir=$(python3 -c 'import os, verl; print(os.path.dirname(os.path.dirname(os.path.realpath(verl.__file__))))')
+if [ "${verl_dir}" != "$(realpath "${WORKING_DIR}")" ]; then
+    echo "FATAL: verl resolves to ${verl_dir}, not ${WORKING_DIR}. Run from the repo root." >&2
+    exit 1
+fi
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/dapo/runtime_env.yaml"}
 NNODES=${NNODES:-1}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
