@@ -6,6 +6,14 @@
 #   NNODES=2 bash recipe/justrl2/run_justrl2_16k.sh        # multi-node
 #   bash recipe/justrl2/run_justrl2_16k.sh critic.optim.lr=1e-5   # override any knob
 #
+# Runs in the foreground by default: main_ppo calls ray.init() itself, so no cluster has to be
+# started first, output is live, and Ctrl-C stops it. Set SUBMIT=1 to dispatch through
+# `ray job submit` against an existing cluster at RAY_ADDRESS instead (needed for multi-node).
+#
+# Before the first run, measure the critic's prior on your own data:
+#   bash recipe/justrl2/run_measure_pass_rate.sh
+# and pass the number it prints as value_head_bias_init (see README.md section 2).
+#
 # 16k context (2k prompt + 14k response). NOTE this is a shortened-context variant of the
 # published 128k recipe, not a reproduction: lambda_i = k ** (1 / L_i) takes the response
 # length as its input, so the same k acts on a different length distribution and the curves
@@ -27,17 +35,23 @@ adv_estimator=gae_length_adaptive
 gamma=1.0                       # must be 1: the decoupled returns are the suffix reward sum
 gae_lambda_k=0.5                # fraction of terminal credit reaching the first token
 critic_warmup=30                # rollouts where only the critic is updated
-# The critic's prior. 0.52 is JustRL-II's value for *their* model and data mix; it should be
-# the base model's mean reward on YOUR training set under the training sampling params. Measure
-# it with `bash recipe/justrl2/run_measure_pass_rate.sh` before a long run -- a wrong value is
-# not fatal but wastes the warmup. See README.md section 2.
-value_head_bias_init=0.52
+# The critic's prior: E[r] under the training sampling params. On this recipe's 0/1 reward
+# scale that is just the base model's pass rate, and V(s) reads as "probability this prefix
+# ends up correct". 0.52 is JustRL-II's number for THEIR model and data -- measure yours with
+# `bash recipe/justrl2/run_measure_pass_rate.sh`. A wrong value is not fatal but wastes the
+# warmup. See README.md section 2.
+value_head_bias_init=${VALUE_HEAD_BIAS_INIT:-0.52}
 
 # ---- 16k context budget -----------------------------------------------------------------
 max_prompt_length=$((1024 * 2))      # 2048
 max_response_length=$((1024 * 14))   # 14336
 enable_overlong_buffer=True
 overlong_buffer_len=2867             # 20% of the response budget (DAPO soft overlong)
+# The penalty is subtracted from the reward, so its weight is relative to the reward span. On
+# the 0/1 scale this recipe uses, factor=1.0 means a maximally-overlong correct answer scores
+# 0 -- exactly as bad as a wrong one. That matches JustRL-II, whose reward is also 0/1. If you
+# switch to REWARD_SCALE=pm1 the same 1.0 only costs half the span, so the two knobs have to
+# move together.
 overlong_penalty_factor=1.0
 exclude_overlong_from_critic=True    # critic regresses reward WITHOUT the length shaping
 
@@ -125,9 +139,34 @@ TEST_FILES=${TEST_FILES:-"['${AIME24_FILE}','${AIME25_FILE}','${AIME26_FILE}']"}
 # inherit it. LOGGER='["console"]' turns wandb off.
 LOGGER=${LOGGER:-'["console","wandb"]'}
 
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python3 -m verl.trainer.main_ppo \
+# ---- reward scale -------------------------------------------------------------------------
+# 0/1 instead of math_dapo's native +/-1, so the critic's V(s) reads as "probability this
+# prefix ends up correct" -- at the prompt that is a difficulty estimate, and the value-head
+# seeding argument works at full strength (E[r^2] = E[r] for a Bernoulli reward, versus
+# E[r^2] = 1 regardless on +/-1). REWARD_SCALE=pm1 reverts to the stock scorer.
+REWARD_SCALE=${REWARD_SCALE:-unit}
+reward_fn_args=()
+if [ "${REWARD_SCALE}" = "unit" ]; then
+    reward_fn_args=(
+        reward.custom_reward_function.path="${WORKING_DIR}/recipe/justrl2/reward_score.py"
+        reward.custom_reward_function.name=compute_score
+    )
+fi
+
+# ---- launch ------------------------------------------------------------------------------
+# Default: run in the foreground. main_ppo calls ray.init() itself, so a local run needs no
+# pre-started cluster. SUBMIT=1 goes through `ray job submit` against RAY_ADDRESS instead,
+# which is what multi-node needs (and what detaches the job from this shell).
+SUBMIT=${SUBMIT:-0}
+if [ "${SUBMIT}" = "1" ]; then
+    launcher=(ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" --working-dir "${WORKING_DIR}" --)
+else
+    launcher=()
+fi
+
+# ${launcher[@]+"${launcher[@]}"} rather than "${launcher[@]}": expanding an empty array trips
+# `set -u` on bash < 4.4, which some cluster images still ship.
+${launcher[@]+"${launcher[@]}"} python3 -m verl.trainer.main_ppo \
     --config-path="${WORKING_DIR}/recipe/justrl2/config" \
     --config-name='justrl2_trainer.yaml' \
     data.train_files="${TRAIN_FILE}" \
@@ -208,6 +247,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     reward.reward_kwargs.overlong_buffer_cfg.log=True \
     reward.reward_kwargs.overlong_buffer_cfg.exclude_from_critic=${exclude_overlong_from_critic} \
     reward.reward_kwargs.max_resp_len=${max_response_length} \
+    ${reward_fn_args[@]+"${reward_fn_args[@]}"} \
     trainer.critic_warmup=${critic_warmup} \
     trainer.logger="${LOGGER}" \
     trainer.project_name="${project_name}" \

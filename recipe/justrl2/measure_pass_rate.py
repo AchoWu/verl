@@ -17,6 +17,12 @@
 with a zero-initialized head V == bias for every token at step 0 and the value loss then opens
 at Var(r) instead of E[r^2]. See recipe/justrl2/README.md section 2.
 
+Note this is the mean *reward*, not the pass rate -- the two differ whenever the scorer is not
+0/1. verl's `math_dapo` scorer (what DAPO-Math-17k and the AIME sets dispatch to) returns
++1 / -1, so a 40% pass rate means E[r] = -0.2 and the bias belongs at -0.2, not 0.4. This
+script reports whatever the configured scorer actually produces, so just use the number it
+prints. JustRL-II's published 0.52 comes from a 0/1 scorer and does not transfer to a +/-1 one.
+
 That makes the sampling config part of the measurement, not a detail: a greedy (temperature=0)
 accuracy is the wrong number. This script samples with the same temperature / top_p / n as
 training and reports the mean over all samples.
@@ -179,6 +185,16 @@ def main():
         print(f"  95% CI (Wilson)              : [{low:.4f}, {high:.4f}]")
     print(f"  samples                      : {all_scores.size} ({len(group_means)} prompts x {n_samples})")
     print(f"  std of individual rewards    : {all_scores.std():.4f}")
+    reward_min, reward_max = float(all_scores.min()), float(all_scores.max())
+    print(f"  reward range seen            : [{reward_min:g}, {reward_max:g}]")
+    if reward_min < 0:
+        # math_dapo returns +1/-1, so "mean reward" and "pass rate" are different numbers and
+        # the bias is legitimately negative. Say so, or it reads like a bug.
+        pass_rate = float((all_scores > 0).mean())
+        print(
+            f"  (scorer is not 0/1: pass rate is {pass_rate:.1%}, but the bias must be the mean "
+            f"reward {mean_reward:.4f})"
+        )
 
     # Why the bias matters, in the two numbers the value loss actually opens at.
     e_r2 = float((all_scores**2).mean())
@@ -187,17 +203,24 @@ def main():
     print(f"    bias = 0.0            -> E[r^2]  = {e_r2:.4f}")
     print(f"    bias = {mean_reward:.4f}         -> Var(r)  = {var_r:.4f}   ({e_r2 / max(var_r, 1e-9):.2f}x lower)")
 
-    # Group-level diagnostics: DAPO drops zero-variance groups, so a high all-same fraction
-    # means most generation batches get filtered and the effective batch size collapses.
-    all_right = float(np.mean(group_means == 1.0))
-    all_wrong = float(np.mean(group_means == 0.0))
+    # Group-level diagnostics. DAPO drops zero-variance groups, so a high all-same fraction
+    # means most of each generation batch gets filtered and the effective batch collapses. Keyed
+    # on the group's reward *spread* rather than on the mean hitting 0 or 1, which only holds for
+    # a 0/1 scorer (math_dapo's all-wrong group has mean -1, not 0).
+    group_max = np.array([np.max(scores) for lists in per_source.values() for scores in lists])
+    group_min = np.array([np.min(scores) for lists in per_source.values() for scores in lists])
+    zero_variance = group_max == group_min
+    all_right = float(np.mean(zero_variance & (group_max > 0)))
+    all_wrong = float(np.mean(zero_variance & (group_max <= 0)))
     print("\n  group diagnostics (relevant to algorithm.filter_groups):")
     print(f"    all-correct groups : {all_right:.1%}")
     print(f"    all-wrong groups   : {all_wrong:.1%}")
-    print(f"    kept by DAPO       : {1 - all_right - all_wrong:.1%}")
+    print(f"    non-degenerate     : {1 - all_right - all_wrong:.1%}")
     if all_right + all_wrong > 0.8:
-        print("    [warn] >80% of groups carry no gradient signal; raise data.gen_batch_size")
-        print("           or pick a training set better matched to this model's difficulty.")
+        print("    [warn] >80% of groups have zero reward spread. With filter_groups on these")
+        print("           are dropped and the effective batch collapses; with it off they stay")
+        print("           but contribute almost no advantage. Consider a training set better")
+        print("           matched to this model, or a larger data.gen_batch_size.")
 
     if len(per_source) > 1:
         print("\n  per data_source:")

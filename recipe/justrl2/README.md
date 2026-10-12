@@ -5,16 +5,21 @@ value head** — a port of [JustRL-II](https://panhaoxuan.notion.site/justrl-ii-
 onto verl's PPO pipeline.
 
 ```bash
-export MODEL_PATH=/path/to/base-model
-export TRAIN_FILE=/path/to/train.parquet
-export TEST_FILE=/path/to/aime-2024.parquet
+export MODEL_PATH=/path/to/DeepSeek-R1-Distill-Qwen-1.5B
+export RAY_DATA_HOME=/path/to/data-root
 
-# 1. measure the base model's mean reward -> the critic's prior (see mechanism 2)
+# 1. fetch DAPO-Math-17k and build the AIME 2024/25/26 validation sets
+bash recipe/justrl2/prepare_data.sh
+
+# 2. measure the base model's mean reward -> the critic's prior (see mechanism 2)
 MAX_PROMPTS=300 bash recipe/justrl2/run_measure_pass_rate.sh
 
-# 2. train, with the number it printed
-bash recipe/justrl2/run_justrl2_16k.sh critic.model.value_head_bias_init=0.47
+# 3. train, with the number step 2 printed
+bash recipe/justrl2/run_justrl2_16k.sh critic.model.value_head_bias_init=0.49
 ```
+
+Step 3 runs in the foreground (`main_ppo` calls `ray.init()` itself). `SUBMIT=1` dispatches
+through `ray job submit` against an existing cluster instead, which is what multi-node needs.
 
 > **This 16k config is not a reproduction of the published recipe.** The core mechanism
 > `λ_i = k^(1/L_i)` takes the response length as its input, so shortening the budget from 128k
@@ -36,6 +41,28 @@ per-trajectory credit. JustRL-II's claim is that it pays off for long-context re
 the sequences are long enough that a uniform advantage wastes most of the signal.
 
 ## The four mechanisms
+
+### 0. Reward scale: 0/1, not ±1
+
+verl's `math_dapo` scorer — which DAPO-Math-17k and the AIME sets dispatch to — returns **+1 /
+−1**. This recipe wraps it to **0 / 1** (`recipe/justrl2/reward_score.py`, wired in by default;
+`REWARD_SCALE=pm1` reverts). The difference is small for a group-baseline method like GRPO,
+where only within-group reward *differences* matter, but it decides what the critic's output
+means:
+
+| reward | what `V(s)` is |
+|---|---|
+| 0/1 | `P(this prefix ends up correct)` — at the prompt, a **difficulty estimate** |
+| ±1 | `2·P(correct) − 1` — the same information, no longer a probability |
+
+It also decides how much mechanism 2 buys. For a Bernoulli reward `E[r²] = E[r]`, so seeding
+the head at the mean takes the opening value loss from `E[r]` to `Var(r) = p(1−p)` — a factor
+of `1/(1−p)`. On ±1, `E[r²] = 1` no matter what, so seeding only removes the `mean²` term
+(measured: 1.09× versus ~1.9×).
+
+One knob moves with the scale: the DAPO overlong penalty is *subtracted* from the reward, so
+`penalty_factor=1.0` is 100% of the span on 0/1 but only 50% on ±1. 1.0 on 0/1 matches
+JustRL-II (whose reward is also 0/1) and means a maximally-overlong correct answer scores 0.
 
 ### 1. Length-adaptive λ (the core)
 
@@ -80,47 +107,47 @@ flow from step 0, since `dV/dw = h ≠ 0`.
 
 Set it via `critic.model.value_head_bias_init`. Code: `verl/utils/model.py::seed_scalar_value_head`.
 
-**Measure this number for your setup** — `0.52` is JustRL-II's value for *their* model and data
-mix, not a universal constant:
+**Measure this number for your setup** — `0.52` is JustRL-II's value for *their* model and
+data, not a universal constant:
 
 ```bash
-MODEL_PATH=/path/to/base-model TRAIN_FILE=/path/to/train.parquet \
-  bash recipe/justrl2/run_measure_pass_rate.sh
-
-# a few hundred prompts already pin the mean to ~±0.03:
 MAX_PROMPTS=300 bash recipe/justrl2/run_measure_pass_rate.sh
 ```
 
 It samples with the **training** sampling params (`temperature=1.0`, `n=8`, full response
-length) and scores with verl's own `default_compute_score`, so the number matches what the
-reward manager will produce. The sampling config is part of the measurement, not a detail: a
-greedy decode measures something else entirely, since the bias has to equal `E[r]` under the
-rollout distribution. The overlong penalty is deliberately not applied, because the critic's
-target excludes it.
+length) and scores with the **same scorer training uses** (the 0/1 wrapper by default), so the
+number is on the right scale. Both are load-bearing: a greedy decode measures something else
+entirely, and a mismatched scorer puts the bias on the wrong scale. The overlong penalty is
+deliberately not applied, because the critic's target excludes it.
 
 Output:
 
 ```
-  mean reward over all samples : 0.4725   <-- value_head_bias_init
-  95% CI (Wilson)              : [0.4241, 0.5215]
+  mean reward over all samples : 0.4896   <-- value_head_bias_init
+  95% CI (Wilson)              : [0.4451, 0.5342]
+  reward range seen            : [0, 1]
 
   initial value loss:
-    bias = 0.0            -> E[r^2]  = 0.4725
-    bias = 0.4725         -> Var(r)  = 0.2492   (1.90x lower)
+    bias = 0.0            -> E[r^2]  = 0.4896
+    bias = 0.4896         -> Var(r)  = 0.2499   (1.96x lower)
 
   group diagnostics (relevant to algorithm.filter_groups):
-    all-correct groups : 22.0%
-    all-wrong groups   : 48.0%
-    kept by DAPO       : 30.0%
+    all-correct groups : 13.3%
+    all-wrong groups   : 20.0%
+    non-degenerate     : 66.7%
 ```
 
-The group diagnostics are a useful side-effect: DAPO drops zero-variance groups, so if most
-groups are all-right or all-wrong, most of each generation batch gets filtered and the
-effective batch collapses. That is a signal to raise `data.gen_batch_size` or pick a training
-set better matched to the model's current ability — worth knowing *before* a 500-step run.
+On the 0/1 scale the mean reward *is* the pass rate, so this number is directly readable. (If
+you run with `REWARD_SCALE=pm1` the script says so and prints both figures, since the bias then
+has to be the mean reward — a negative number — rather than the pass rate.)
+
+The group diagnostics are a useful side-effect. Groups whose 8 samples all score the same carry
+almost no advantage signal — DAPO drops them when `filter_groups` is on, and when it is off
+they stay in the batch contributing nothing. Either way, a high fraction means the training set
+is mismatched to the model's current ability, which is worth knowing *before* a long run.
 
 Already have generations? `SKIP_GEN=1 GEN_OUTPUT=<parquet> bash recipe/justrl2/run_measure_pass_rate.sh`.
-Train with a custom scorer? Pass `CUSTOM_REWARD_PATH` so the measurement uses the same one.
+Train with a different scorer? Pass `CUSTOM_REWARD_PATH` so the measurement uses the same one.
 
 ### 3. Critic-only warmup
 
@@ -153,6 +180,7 @@ The critic also skips the in-reward KL penalty for the same reason.
 
 | knob | value | what it is |
 |---|---|---|
+| `reward.custom_reward_function.path` | `recipe/justrl2/reward_score.py` | mechanism 0 — 0/1 reward |
 | `algorithm.adv_estimator` | `gae_length_adaptive` | mechanism 1 |
 | `algorithm.gamma` | `1.0` | **required**; asserted |
 | `algorithm.gae_lambda_k` | `0.5` | terminal credit reaching token 0 |
@@ -202,7 +230,9 @@ upstream, and what would have to be ported and verified before trusting a megatr
 ```bash
 pytest tests/trainer/ppo/test_length_adaptive_gae_on_cpu.py \
        tests/utils/test_value_head_seeding_on_cpu.py \
-       tests/utils/test_config_length_adaptive_gae_on_cpu.py -q
+       tests/utils/test_config_length_adaptive_gae_on_cpu.py \
+       tests/utils/test_justrl2_reward_score_on_cpu.py \
+       tests/experimental/agent_loop/test_critic_rm_scores_on_cpu.py -q
 ```
 
 Covers the `λ^L = k` invariant across lengths and `k` values; **bf16 inputs producing the same
@@ -210,7 +240,9 @@ result as fp32** (the regression that silently disabled mechanism 1); returns be
 of `values` (i.e. genuinely λ=1 rather than `advantages + values`); the critic reward override
 affecting only returns; advantage whitening; the γ≠1 and missing-`k` guards; both value-head
 layouts (`score` and TRL's `v_head.summary`); bias creation when the head was built without one;
-that gradients still flow through a zeroed weight; and every config guard in the table above.
+that gradients still flow through a zeroed weight; the ±1→0/1 rescaling (including that `acc`
+survives for the group filter); the multi-output `reward_extra_info` aliasing regression; and
+every config guard in the table above.
 
 ## Files
 
@@ -236,6 +268,9 @@ Recipe-local:
 |---|---|
 | `run_justrl2_16k.sh` | the 16k training run |
 | `config/justrl2_trainer.yaml` | recipe defaults (estimator, `reward_kwargs`) |
+| `reward_score.py` | 0/1 reward wrapper (`REWARD_SCALE=pm1` to skip) |
+| `prepare_data.sh` | fetch DAPO-Math-17k, build the AIME sets |
+| `prepare_aime_data.py` | AIME 2024/25/26 → verl schema, per-year `data_source` |
 | `measure_pass_rate.py` | score generations → `value_head_bias_init` |
 | `run_measure_pass_rate.sh` | generate + score in one go |
 

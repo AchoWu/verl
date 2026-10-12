@@ -43,7 +43,15 @@ ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.85}
 # ---- scoring ----------------------------------------------------------------------------
 MAX_PROMPTS=${MAX_PROMPTS:--1}
 NUM_WORKERS=${NUM_WORKERS:-$(( $(nproc 2>/dev/null || echo 8) / 2 ))}
-CUSTOM_REWARD_PATH=${CUSTOM_REWARD_PATH:-}
+# Must match the scorer training uses, or the measured mean is on the wrong scale and the bias
+# is wrong. run_justrl2_16k.sh defaults to the 0/1 wrapper; REWARD_SCALE=pm1 drops back to the
+# stock +/-1 scorer in both scripts.
+REWARD_SCALE=${REWARD_SCALE:-unit}
+if [ "${REWARD_SCALE}" = "unit" ]; then
+    CUSTOM_REWARD_PATH=${CUSTOM_REWARD_PATH:-"${PWD}/recipe/justrl2/reward_score.py"}
+else
+    CUSTOM_REWARD_PATH=${CUSTOM_REWARD_PATH:-}
+fi
 CUSTOM_REWARD_NAME=${CUSTOM_REWARD_NAME:-compute_score}
 
 SKIP_GEN=${SKIP_GEN:-0}
