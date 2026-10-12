@@ -72,9 +72,9 @@ def _init_scorer(custom_path, custom_name):
     """Resolve the scoring function once per worker process."""
     global _SCORER
     if custom_path:
-        from verl.utils.import_utils import load_extern_object
+        from verl.utils.import_utils import load_extern_type
 
-        _SCORER = load_extern_object(module_path=custom_path, object_name=custom_name)
+        _SCORER = load_extern_type(custom_path, custom_name)
     else:
         from verl.utils.reward_score import default_compute_score
 
