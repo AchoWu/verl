@@ -43,3 +43,6 @@ critic:
 
 trainer:
   project_name: verl-justrl2
+  # Log only val-core/<data_source>/acc/mean@<n> (one number per AIME year) instead of the full
+  # best/worst/maj@k grid for acc, reward, score and every reward_extra_info key.
+  val_mean_acc_only: True

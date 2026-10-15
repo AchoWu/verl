@@ -728,6 +728,10 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        if self.config.trainer.get("val_mean_acc_only", False):
+            # one number per data source: val-core/<data_source>/<acc|reward>/mean@<n>
+            metric_dict = {k: v for k, v in metric_dict.items() if k.startswith("val-core/") and "/mean@" in k}
+
         return metric_dict
 
     def init_workers(self):

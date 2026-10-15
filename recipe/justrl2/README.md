@@ -215,7 +215,8 @@ The critic also skips the in-reward KL penalty for the same reason.
 | `algorithm.gae_lambda_k` | `0.5` | terminal credit reaching token 0 |
 | `critic.model.value_head_bias_init` | `0.52` | mechanism 2 — **measure yours** (see above) |
 | `trainer.critic_warmup` | `31` | mechanism 3 — 30 critic-only rollouts (verl counts from 1) |
-| `reward_model.overlong_buffer.exclude_from_critic` | `True` | mechanism 4 |
+| `reward_model.overlong_buffer.exclude_from_critic` | `False` | mechanism 4 — only meaningful with the penalty on |
+| `reward_model.overlong_buffer.enable` | `False` | DAPO soft overlong penalty off (see below) |
 | `algorithm.rollout_is*` | `mask`, `token`, `[0.5, 5.0]`, veto off | IcePop: JustRL-II's `--use-tis` + `icepop_function` |
 | `actor_rollout_ref.rollout.calculate_log_probs` | `True` | rollout log-probs for the IcePop ratio |
 | `*.optim.betas` | `[0.9, 0.98]` | JustRL-II's Adam beta2, actor and critic (verl default 0.999) |
@@ -224,21 +225,30 @@ The critic also skips the in-reward KL penalty for the same reason.
 | `actor…clip_ratio_low/high` | `0.2` / `0.28` | clip-higher |
 | `data.max_prompt_length` | `2048` | 16k budget |
 | `data.max_response_length` | `14336` | 16k budget |
-| `reward_model.overlong_buffer.len` | `2867` | 20% of the response budget |
+| `reward_model.overlong_buffer.len` | `2867` | 20% of the response budget, when the penalty is on |
+| `trainer.val_before_train` | `True` | step-0 AIME baseline |
+| `trainer.val_mean_acc_only` | `True` | log only `val-core/<year>/acc/mean@n` (recipe yaml) |
 
 ### Deliberate departures from JustRL-II
 
+- **No overlong penalty by default.** In the first 16k run (penalty from 11,469 tokens, factor
+  1.0) about two thirds of the training-reward gain was the penalty disappearing — responses
+  shrank 9.5k → 5.3k tokens — while AIME acc stayed flat. Truncated responses still score 0.
+  Restore JustRL-II's setting with `ENABLE_OVERLONG_BUFFER=True OVERLONG_PENALTY_FACTOR=1.0
+  EXCLUDE_OVERLONG_FROM_CRITIC=True`.
 - **No DAPO dynamic sampling / 2× over-sampling** (`filter_groups.enable=False`). JustRL-II drops
   zero-reward-variance groups. With critic-based advantages those groups still carry a non-zero
   advantage, so this changes the training signal rather than only the throughput. Turn it on with
   `algorithm.filter_groups.enable=True algorithm.filter_groups.metric=acc data.gen_batch_size=64`.
 - **No partial rollout** — verl 0.6 has no equivalent.
-- **Batch and schedule**: GBS 256 (JustRL-II 1-node 16k: 64). `trainer.total_training_steps=1000`
-  (JustRL-II runs 500 rollouts) overrides `total_epochs=1`; checkpoints and AIME evals every 50
-  steps. One epoch of UltraData-RL-Math is ⌊32,412 / 32⌋ = 1,012 steps (no prompt exceeds the
-  2048-token budget, so none are filtered), so 1000 steps see 32,000 prompts — nearly the whole
-  set once, each row at most once. JustRL-II's 1-node 16k run trains on 500 × 8 = 4,000
-  prompts (more are generated, then dropped by dynamic sampling).
+- **Batch and schedule**: GBS 64 × 8 = 512 in 4 mini-batches of 16 prompts, so 4 actor and 4
+  critic updates per rollout (JustRL-II 1-node 16k: 64). `trainer.total_training_steps=1000`
+  (JustRL-II runs 500 rollouts) with `total_epochs=2`; checkpoints and AIME evals every 50 steps.
+  One epoch of UltraData-RL-Math is ⌊32,412 / 64⌋ = 506 steps (no prompt exceeds the 2048-token
+  budget, so none are filtered), so 1000 steps see 64,000 prompts — about two passes. The trainer
+  stops at whichever of the two limits comes first, so `total_epochs=1` would end at step 506.
+  The first run used 32 prompts with mini == train: one on-policy step per rollout, the PPO clip
+  never engaged, and AIME did not move.
 
 ### Misconfigurations fail loudly
 

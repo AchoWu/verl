@@ -29,6 +29,7 @@
 #   2. value-head seeding         critic.model.value_head_bias_init
 #   3. critic-only warmup         trainer.critic_warmup
 #   4. penalty kept out of critic reward_model.overlong_buffer.exclude_from_critic
+#      (OFF by default here: the overlong penalty itself is disabled, see the 16k section)
 # Also carried over from JustRL-II's run config: IcePop rollout correction (algorithm.rollout_is*)
 # and Adam beta2=0.98. Not carried over: dynamic sampling and partial rollout (see README).
 set -xeuo pipefail
@@ -42,7 +43,9 @@ trap '
 ' EXIT INT TERM
 
 project_name='verl-justrl2'
-exp_name='justrl2-16k-r1-distill-1.5b'
+# A new name, not the first run's: resume_mode=auto would otherwise pick up its step-1000
+# checkpoint under the same CKPTS_DIR and exit immediately.
+exp_name=${EXP_NAME:-'justrl2-16k-r1-distill-1.5b-nopen-bs64'}
 
 # ---- JustRL-II core ---------------------------------------------------------------------
 adv_estimator=gae_length_adaptive
@@ -55,18 +58,23 @@ critic_warmup=31                # 30 critic-only rollouts, as JustRL-II: verl's 
 # scale that is just the base model's pass rate, and V(s) reads as "probability this prefix
 # ends up correct". 0.52 is JustRL-II's number for THEIR model and data -- measure yours with
 # `bash recipe/justrl2/run_measure_pass_rate.sh`.
-value_head_bias_init=${VALUE_HEAD_BIAS_INIT:-0.52}
+value_head_bias_init=${VALUE_HEAD_BIAS_INIT:-0.34}
 
 # ---- 16k context budget -----------------------------------------------------------------
 max_prompt_length=$((1024 * 2))      # 2048
 max_response_length=$((1024 * 14))   # 14336
-enable_overlong_buffer=True
-overlong_buffer_len=2867             # 20% of the response budget (DAPO soft overlong)
-# The penalty is subtracted from the reward, so its weight is relative to the reward span. On
-# the 0/1 scale this recipe uses, factor=1.0 means a maximally-overlong correct answer scores
-# 0 -- exactly as bad as a wrong one. That matches JustRL-II, whose reward is also 0/1.
-overlong_penalty_factor=1.0
-exclude_overlong_from_critic=True    # critic regresses reward WITHOUT the length shaping
+# DAPO soft overlong penalty: OFF. In the first 16k run (penalty from 11469 tokens, factor 1.0)
+# about 2/3 of the training-reward gain was the penalty going away -- responses shrank 9.5k ->
+# 5.3k -- while AIME acc stayed flat: on AIME the buffer zone is where the base model does most
+# of its reasoning. A truncated response still scores 0 (no \boxed{}), so length stays bounded.
+# To restore JustRL-II's setting: ENABLE_OVERLONG_BUFFER=True OVERLONG_PENALTY_FACTOR=1.0
+# EXCLUDE_OVERLONG_FROM_CRITIC=True (exclude_from_critic requires the buffer to be on).
+enable_overlong_buffer=${ENABLE_OVERLONG_BUFFER:-False}
+overlong_buffer_len=2867             # 20% of the response budget
+# The penalty is subtracted from the reward, so its weight is relative to the 0/1 reward span:
+# factor=1.0 means a maximally-overlong correct answer scores 0, as bad as a wrong one.
+overlong_penalty_factor=${OVERLONG_PENALTY_FACTOR:-0.0}
+exclude_overlong_from_critic=${EXCLUDE_OVERLONG_FROM_CRITIC:-False}
 
 # ---- PPO --------------------------------------------------------------------------------
 actor_lr=1e-6
@@ -90,12 +98,14 @@ rollout_is_threshold=5.0
 rollout_is_threshold_lower=0.5
 
 # ---- rollout / batching -----------------------------------------------------------------
-# GBS = 32 * 8 = 256. JustRL-II's release recipe is 60 * 8 = 480 on 16 nodes; its 1-node 16k
-# variant drops to 8 * 8 = 64, which is a memory concession for MiniCPM-2B at 16k rather than
-# an algorithmic choice.
-train_prompt_bsz=32
+# GBS = 64 * 8 = 512, split into 4 mini-batches of 16 prompts -> 4 actor and 4 critic updates
+# per rollout. The first run used 32 prompts with mini == train: one on-policy gradient step per
+# rollout (pg_clipfrac and ppo_kl were exactly 0, so the PPO clip never engaged) and ~970 actor
+# updates in total. This doubles the prompts seen and quadruples the updates; expect roughly 2x
+# the wall-clock per step. JustRL-II's release recipe is 60 * 8 = 480 on 16 nodes.
+train_prompt_bsz=${TRAIN_PROMPT_BSZ:-64}
 n_resp_per_prompt=8
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-16}
 enable_filter_groups=False
 filter_groups_metric=acc
 max_num_gen_batches=10
@@ -121,10 +131,10 @@ infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 critic_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2 / sp_size))
 
 # ---- schedule ---------------------------------------------------------------------------
-# 1000 steps (JustRL-II runs 500). total_training_steps overrides the epoch count, so
-# total_epochs=1 only matters if you drop it: one epoch of UltraData-RL-Math is
-# floor(32412 / 32) = 1012 steps, so 1000 steps covers 32,000 prompts, nearly all of it once.
-total_epochs=${TOTAL_EPOCHS:-1}
+# 1000 steps (JustRL-II runs 500) = 64,000 prompts, about two passes over UltraData-RL-Math.
+# One epoch is floor(32412 / 64) = 506 steps, and the trainer's loop stops at whichever of
+# total_epochs / total_training_steps comes first, so total_epochs must be >= 2 for 1000 steps.
+total_epochs=${TOTAL_EPOCHS:-2}
 total_training_steps=${TOTAL_TRAINING_STEPS:-1000}
 save_freq=${SAVE_FREQ:-50}
 # Aligned with save_freq so every checkpoint has a matching eval point.
@@ -247,7 +257,7 @@ ${launcher[@]+"${launcher[@]}"} python3 -m recipe.dapo.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=4 \
+    actor_rollout_ref.rollout.val_kwargs.n=8 \
     critic.enable=True \
     critic.strategy=fsdp \
     critic.model.path="${CRITIC_MODEL_PATH}" \
@@ -280,7 +290,7 @@ ${launcher[@]+"${launcher[@]}"} python3 -m recipe.dapo.main_dapo \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.save_freq=${save_freq} \
     trainer.test_freq=${test_freq} \
     trainer.total_epochs=${total_epochs} \
