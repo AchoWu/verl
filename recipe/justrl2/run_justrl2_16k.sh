@@ -173,7 +173,7 @@ TEST_FILES=${TEST_FILES:-"['${AIME24_FILE}','${AIME25_FILE}','${AIME26_FILE}']"}
 # ---- tracking -----------------------------------------------------------------------------
 # wandb logs under trainer.project_name / trainer.experiment_name. Export WANDB_API_KEY, or
 # `wandb login`, before starting. LOGGER='["console"]' turns wandb off.
-LOGGER=${LOGGER:-'["console","wandb"]'}
+LOGGER=${LOGGER:-'["console","wandb","file"]'}
 
 # ---- reward -------------------------------------------------------------------------------
 # JustRL-II's `--rm-type math`: last \boxed{} graded 0/1 (mathd + sympy, math-verify fallback),
