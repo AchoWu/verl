@@ -155,7 +155,7 @@ fi
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/dapo/runtime_env.yaml"}
 NNODES=${NNODES:-1}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"/group/40143/howu/verl"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/llms/DeepSeek-R1-Distill-Qwen-1.5B"}
 # The critic starts from the same base weights; HF builds its scalar head fresh.
 CRITIC_MODEL_PATH=${CRITIC_MODEL_PATH:-"${MODEL_PATH}"}
