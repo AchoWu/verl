@@ -217,6 +217,20 @@ class TestDataParallelPPOActor(unittest.TestCase):
                 self.assertIsInstance(metrics[key], (float, int))
                 self.assertTrue(torch.isfinite(torch.tensor(metrics[key])))
 
+    def test_update_policy_num_mini_batches_override(self):
+        """meta_info['num_mini_batches'] fixes the optimizer step count for a batch of any size."""
+        data = DataProto.concat([self._create_test_data_for_update_policy() for _ in range(3)])[:10]
+
+        # By rows: ppo_mini_batch_size=4 splits 10 rows into 4 + 4 + 2 -> 3 optimizer steps.
+        metrics = self.actor.update_policy(data)
+        self.assertEqual(len(metrics["actor/grad_norm"]), 3)
+
+        data.meta_info["num_mini_batches"] = 2
+        metrics = self.actor.update_policy(data)
+        self.assertEqual(len(metrics["actor/grad_norm"]), 2)
+        # 5 rows per mini-batch in micro-batches of 2 + 2 + 1, each scaled by its share of the 5 rows.
+        self.assertEqual(len(metrics["actor/pg_loss"]), 6)
+
     def test_dataparallelppoactor_initialization(self):
         """Test DataParallelPPOActor initialization"""
         self.assertIsNotNone(self.actor.actor_module)

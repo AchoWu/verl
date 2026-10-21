@@ -1,0 +1,47 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+reward_model:
+  reward_manager: dapo
+  # Read by load_reward_manager. Must stay off while replay_coef > 0: replay keeps only r > 0 rows,
+  # which assumes rewards in [0, 1] (validate_self_imitation_config enforces it).
+  overlong_buffer:
+    enable: False
+    len: 0
+    penalty_factor: 0.0
+    log: False
+    exclude_from_critic: False
+
+algorithm:
+  # Not read by the self_imitation trainer, which computes its own advantages (Dr. GRPO for the
+  # current rows: r - p_cur, no std). Set so that need_critic and the base trainer's checks see a
+  # critic-free estimator.
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+
+critic:
+  enable: False
+
+trainer:
+  project_name: verl-self-imitation
+  val_mean_acc_only: True
+
+# Forgetting-gated self-imitation (RL_Idea_与过去的自己比较的策略优化.md).
+self_imitation:
+  # k: replay for step t is sampled at step t-k, i.e. by the policy k updates ago. 0 samples it from
+  # the current policy -- the null run used to calibrate gate_tau.
+  lag_steps: 16
+  # m: replay rollouts per prompt. 0 turns replay generation off entirely (plain Dr. GRPO).
+  num_replay: 8
+  # lambda: weight of the replay term relative to the GRPO term. 0 still generates replay and logs
+  # the gate statistics, but trains on none of it.
+  replay_coef: 1.0
+  # tau: replay a prompt only if p_old - p_cur >= tau. Under the null (same policy, n = m = 8) the
+  # gate opens by sampling noise alone with probability 10.5% at p = 0.5 and 5.6% at p = 0.2 / 0.8
+  # for tau = 3/8 (3.8% / 1.3% for tau = 1/2). Calibrate on your data with lag_steps=0.
+  gate_tau: 0.375

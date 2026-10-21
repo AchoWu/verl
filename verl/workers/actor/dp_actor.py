@@ -385,13 +385,21 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        # A caller whose batch size varies from step to step (recipe/self_imitation appends a variable
+        # number of replay rows) pins the number of optimizer steps instead of the rows per step, so
+        # the extra rows never spill into a small trailing mini-batch.
+        num_mini_batches = data.meta_info.get("num_mini_batches")
+        if num_mini_batches is not None:
+            mini_batches = data.chunk(num_mini_batches)
+        else:
+            mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                mini_batch_rows = len(mini_batch) if num_mini_batches is not None else self.config.ppo_mini_batch_size
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -414,8 +422,8 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    if self.config.use_dynamic_bsz:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    if self.config.use_dynamic_bsz or num_mini_batches is not None:
+                        loss_scale_factor = response_mask.shape[0] / mini_batch_rows
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
