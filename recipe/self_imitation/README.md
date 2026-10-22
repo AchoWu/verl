@@ -41,18 +41,41 @@ no second engine, no weight swapping. The first `k` steps train without replay.
 | method | `bash recipe/self_imitation/run_self_imitation_16k.sh` |
 | Dr. GRPO-8 | `NUM_REPLAY=0 …` |
 | **Dr. GRPO-16** (same rollout budget — the key control) | `NUM_REPLAY=0 N_RESP_PER_PROMPT=16 …` |
-| null gate (calibrates τ) | `LAG_STEPS=0 REPLAY_COEF=0 …` — a few dozen steps is enough |
+| null gate (optional: empirical check of `gate_null_frac`) | `LAG_STEPS=0 REPLAY_COEF=0 …` — a few dozen steps is enough |
 | justrl2 (critic) | `bash recipe/justrl2/run_justrl2_16k.sh` |
 
-**Look at `self_imitation/gate_open_frac` first**, against the null run. If the two are close,
-forgetting is rare at this `k` and the method has nothing to act on. Under the null with
-n = m = 8, τ = 3/8 opens by noise alone on 10.5% of prompts at p = 0.5 (5.6% at p = 0.2 / 0.8).
+**Look at `self_imitation/gate_excess` first.** It is the gate's open rate minus
+`gate_null_frac`, the exact rate at which the same prompts would open on sampling noise alone
+(idea doc §3.4.1), so no separate null run is needed. It is a *net* signal: zero in expectation
+when `p_old = p_cur`, ≤ 0 in expectation when nothing was forgotten, and pulled down by prompts the
+policy is learning.
+
+Judge it over a window of steps with the **pooled z**, from the logged sums:
+
+```
+z_window = Σ (gate_open_count − gate_null_sum) / sqrt(Σ gate_null_var_sum)
+```
+
+(same with the `gate_learn_*` sums for the reverse gate). Steps draw different prompts, so the sums
+add. Do not average the per-step `gate_excess_z` curve: the mean of W independent z has standard
+deviation 1/√W, so a 36-step mean of 0.5 is already 3σ. "Clearly" below means pooled z ≳ 3.
+
+| `gate_excess` | `gate_learn_excess` | reading |
+|---|---|---|
+| clearly > 0 | any | forgetting is real; replay has something to act on |
+| ≤ 0 | clearly > 0 | inconclusive: no forgetting, or forgetting masked by learning |
+| ≈ 0 | ≈ 0 | old and current policy barely differ per prompt: raise `k` |
+
+Never lower τ to "find" forgetting: that only admits more noise.
 
 ## Metrics (`self_imitation/…`)
 
 | metric | meaning |
 |---|---|
 | `gate_open_frac`, `delta_mean`, `delta_q95` | share of prompts replayed; distribution of `p_old − p_cur` |
+| `gate_null_frac`, `gate_excess`, `gate_excess_z` | no-forgetting baseline of the open rate (hypergeometric, given each prompt's total correct count); open rate minus it; per-step z |
+| `gate_learn_frac`, `gate_learn_excess`, `gate_learn_excess_z` | the same for the reverse gate `p_cur − p_old ≥ τ`, against its own null (equal to the forward one when n = m) |
+| `gate_open_count`, `gate_null_sum`, `gate_null_var_sum` (and `gate_learn_count`, `gate_learn_null_sum`, `gate_learn_null_var_sum`) | raw per-step sums for the pooled z above |
 | `cur_all_wrong_frac`, `rescued_all_wrong_frac` | zero-signal prompts for GRPO, and the share of them replay gave a positive signal |
 | `replay_rows`, `replay_token_frac`, `pad_rows` | how much replay entered the batch |
 | `replay_log_ratio_mean`, `replay_forgotten_token_frac` | `log π_prox/π_lag` on replayed tokens; share below the PPO lower clip (includes vLLM/FSDP mismatch) |
@@ -85,8 +108,9 @@ on the current rows only, so they stay comparable to a plain GRPO run.
   replay (a warning says so).
 - **`rollout.calculate_log_probs=True` is required** whenever `num_replay > 0`: π_lag's log-probs
   only come from the rollout.
-- **Rewards must be in [0, 1]** (replay keeps only `r > 0` rows): the overlong penalty is rejected
-  while `replay_coef > 0`. Other unsupported settings (critic, megatron, async rollout, in-reward
+- **Rewards must be 0/1.** The gate, its noise baseline and replay's `r > 0` filter all assume it.
+  The overlong penalty is rejected at startup while `replay_coef > 0`, and any non-0/1 reward fails
+  at step 1 (`group_counts`). Other unsupported settings (critic, megatron, async rollout, in-reward
   KL, reward model, `rollout_data_dir`) fail at startup in `validate_self_imitation_config`.
 
 ## Files

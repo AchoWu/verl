@@ -11,8 +11,9 @@
 #   NUM_REPLAY=0                         plain Dr. GRPO-8 (half the rollouts)
 #   NUM_REPLAY=0 N_RESP_PER_PROMPT=16    Dr. GRPO-16: equal rollout budget, the key control
 #   REPLAY_COEF=0                        generates replay and logs the gate, trains on none of it
-#   LAG_STEPS=0 REPLAY_COEF=0            null run: gate statistics when nothing was forgotten;
-#                                        use self_imitation/delta_q95 to set GATE_TAU
+#   LAG_STEPS=0 REPLAY_COEF=0            null run (optional): gate statistics when nothing was
+#                                        forgotten. Every run already logs the exact baseline as
+#                                        self_imitation/gate_null_frac and gate_excess.
 #
 # Data and reward are JustRL-II's, from recipe/justrl2 (prepare once with
 # `bash recipe/justrl2/prepare_data.sh`; this recipe only reads them).

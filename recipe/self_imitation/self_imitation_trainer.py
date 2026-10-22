@@ -63,7 +63,7 @@ class _PromptBatch:
         self.uids = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object)
         # Replay rows live in the object store while they wait: ~150 MB per step at 16k context.
         self.replay_ref = None
-        self.p_old: dict[str, float] | None = None
+        self.old_counts: dict[str, tuple[int, int]] | None = None
 
     def expand(self, trainer: RayPPOTrainer, times: int) -> tuple[DataProto, DataProto]:
         """(non-generation fields, generation input), each repeated `times` per prompt."""
@@ -119,7 +119,7 @@ class RaySelfImitationTrainer(RayPPOTrainer):
             cur_batch, extra = self._score(cur_rest.union(out[: len(cur_gen)]))
             if ahead is not None:
                 replay_batch, _ = self._score(ahead_rest.union(out[len(cur_gen) :]))
-                rows, ahead.p_old = stash_replay(replay_batch)
+                rows, ahead.old_counts = stash_replay(replay_batch)
                 ahead.replay_ref = ray.put(rows) if rows is not None else None
         return cur_batch, extra
 
@@ -133,7 +133,7 @@ class RaySelfImitationTrainer(RayPPOTrainer):
         batch, n_replay, si_metrics = build_train_batch(
             train_view(cur_batch, ROW_CUR),
             replay,
-            cur.p_old,
+            cur.old_counts,
             tau=si.gate_tau,
             coef=si.replay_coef,
             row_divisor=world_size * num_mini_batches,

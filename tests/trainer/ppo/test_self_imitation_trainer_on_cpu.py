@@ -141,6 +141,8 @@ def test_replay_reaches_the_step_lag_updates_later(trainer):
     assert (update.batch["responses"][kinds == ROW_CUR] == 3).all()
     assert update.meta_info["num_mini_batches"] == N_PROMPTS // 2
     assert metrics["self_imitation/gate_open_frac"] == 1.0
+    # K_o 2, K_c 0 of M = N = 2: T = 2 opens only on a 2:0 split, 1 of C(4, 2) = 6.
+    assert metrics["self_imitation/gate_null_frac"] == pytest.approx(1 / 6)
     assert metrics["self_imitation/rescued_all_wrong_frac"] == 1.0
     # A = coef * (1 - p_cur) = 1 on replay rows, times the N_all / N_cur denominator fix.
     scale = metrics["self_imitation/adv_scale"]

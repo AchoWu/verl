@@ -34,7 +34,7 @@ trainer:
 # Forgetting-gated self-imitation (RL_Idea_与过去的自己比较的策略优化.md).
 self_imitation:
   # k: replay for step t is sampled at step t-k, i.e. by the policy k updates ago. 0 samples it from
-  # the current policy -- the null run used to calibrate gate_tau.
+  # the current policy (an empirical null run; gate_null_frac already gives the exact baseline).
   lag_steps: 16
   # m: replay rollouts per prompt. 0 turns replay generation off entirely (plain Dr. GRPO).
   num_replay: 8
@@ -43,5 +43,6 @@ self_imitation:
   replay_coef: 1.0
   # tau: replay a prompt only if p_old - p_cur >= tau. Under the null (same policy, n = m = 8) the
   # gate opens by sampling noise alone with probability 10.5% at p = 0.5 and 5.6% at p = 0.2 / 0.8
-  # for tau = 3/8 (3.8% / 1.3% for tau = 1/2). Calibrate on your data with lag_steps=0.
+  # for tau = 3/8 (3.8% / 1.3% for tau = 1/2). Every step logs the baseline for its own prompts as
+  # self_imitation/gate_null_frac; judge forgetting by gate_excess, not by lowering tau.
   gate_tau: 0.375

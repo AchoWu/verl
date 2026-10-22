@@ -29,6 +29,7 @@ Both kinds of trained rows share the baseline p_cur, the current policy's pass r
 
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
+from math import comb, sqrt
 from typing import TypeVar
 
 import numpy as np
@@ -85,12 +86,28 @@ def seq_scores(batch: DataProto) -> np.ndarray:
     return batch.batch["token_level_scores"].sum(-1).float().numpy()
 
 
-def group_mean(uids: np.ndarray, scores: np.ndarray) -> dict[str, float]:
-    sums, counts = defaultdict(float), defaultdict(int)
+def group_counts(uids: np.ndarray, scores: np.ndarray) -> dict[str, tuple[int, int]]:
+    """Per-prompt (correct, samples).
+
+    The gate, its noise baseline (a hypergeometric split of correct counts) and replay's r > 0 row
+    filter all assume 0/1 rewards; a partial-credit reward would quietly break all three. Current
+    rollouts are counted every step, so a non-binary reward fails at step 1.
+    """
+    binary = np.isin(scores, (0.0, 1.0))
+    if not binary.all():
+        raise ValueError(
+            f"self_imitation needs 0/1 rewards, got e.g. {scores[~binary][:3].tolist()}. Check "
+            "custom_reward_function and keep reward_model.overlong_buffer disabled."
+        )
+    correct, samples = defaultdict(int), defaultdict(int)
     for uid, score in zip(uids, scores, strict=True):
-        sums[uid] += float(score)
-        counts[uid] += 1
-    return {uid: sums[uid] / counts[uid] for uid in sums}
+        correct[uid] += int(score)
+        samples[uid] += 1
+    return {uid: (correct[uid], samples[uid]) for uid in samples}
+
+
+def pass_rates(counts: dict[str, tuple[int, int]]) -> dict[str, float]:
+    return {uid: correct / samples for uid, (correct, samples) in counts.items()}
 
 
 def train_view(batch: DataProto, kind: int) -> DataProto:
@@ -102,18 +119,18 @@ def train_view(batch: DataProto, kind: int) -> DataProto:
     return view
 
 
-def stash_replay(batch: DataProto) -> tuple[DataProto | None, dict[str, float]]:
+def stash_replay(batch: DataProto) -> tuple[DataProto | None, dict[str, tuple[int, int]]]:
     """Reduce a scored pi_lag rollout to what a later step can use.
 
-    Returns the per-prompt pass rate p_old (from all rows) and only the rows with r > 0: with
-    rewards in [0, 1] and p_cur >= 0, (r - p_cur)_+ is zero for every other row, so they would
-    never be trained on and are not worth holding for `lag_steps` steps.
+    Returns the per-prompt (correct, samples) counts over all rows, and only the rows with r = 1:
+    (r - p_cur)_+ is zero for every other row, so they would never be trained on and are not worth
+    holding for `lag_steps` steps.
     """
     scores = seq_scores(batch)
-    p_old = group_mean(batch.non_tensor_batch["uid"], scores)
+    old_counts = group_counts(batch.non_tensor_batch["uid"], scores)
     keep = np.flatnonzero(scores > 0)
     rows = train_view(batch[keep], ROW_REPLAY) if keep.size else None
-    return rows, p_old
+    return rows, old_counts
 
 
 def gate_open(p_cur: dict[str, float], p_old: dict[str, float], tau: float) -> dict[str, bool]:
@@ -121,10 +138,79 @@ def gate_open(p_cur: dict[str, float], p_old: dict[str, float], tau: float) -> d
     return {uid: uid in p_old and p_old[uid] - p_cur[uid] >= tau - _GATE_EPS for uid in p_cur}
 
 
+def null_open_prob(t: int, m: int, n: int, tau: float) -> float:
+    """P(K_o/m - K_c/n >= tau | K_o + K_c = t) when old and current policy share one pass rate.
+
+    The split of the t correct rollouts between the m old and n current ones is then
+    hypergeometric whatever that rate is, so this is the exact chance the gate opens on noise alone
+    given what was observed (Fisher's exact / permutation argument; idea doc 3.4.1). Swap m and n
+    for the reverse gate p_cur - p_old >= tau.
+    """
+    hits = sum(
+        comb(m, i) * comb(n, t - i)
+        for i in range(max(0, t - n), min(m, t) + 1)
+        if i / m - (t - i) / n >= tau - _GATE_EPS
+    )
+    return hits / comb(m + n, t)
+
+
+def _against_null(opened: list[bool], null: list[float]) -> tuple[int, float, float, float, float]:
+    """(open count, null sum, null variance sum, excess, z) for one gate direction over a batch.
+
+    The three sums are what pools across steps: z over any window is
+    sum(count - null_sum) / sqrt(sum(null_var_sum)). Averaging per-step z instead understates
+    significance (the mean of W independent z has sd 1 / sqrt(W)).
+    """
+    null = np.asarray(null, dtype=np.float64)
+    count, null_sum, var_sum = int(np.sum(opened)), float(null.sum()), float(np.sum(null * (1 - null)))
+    excess = (count - null_sum) / len(null)
+    # A prompt whose null is 0 cannot open at all, so var_sum == 0 implies count == null_sum == 0.
+    z = (count - null_sum) / sqrt(var_sum) if var_sum > 0 else 0.0
+    return count, null_sum, var_sum, excess, z
+
+
+def gate_noise_metrics(
+    cur_counts: dict[str, tuple[int, int]],
+    old_counts: dict[str, tuple[int, int]],
+    gate: dict[str, bool],
+    tau: float,
+) -> dict[str, float]:
+    """Forward (forgetting) and reverse (learning) gate rates against their no-forgetting baseline.
+
+    `gate` is the forward gate as build_train_batch evaluated it; the reverse gate is the same
+    gate_open with old and current swapped, so the condition is defined once. gate_excess has
+    expectation 0 when p_old == p_cur on every prompt and <= 0 when nothing was forgotten: a net
+    signal that learning pulls down. gate_learn_excess shows how hard. Idea doc 3.4.1.
+    """
+    learn = gate_open(pass_rates(old_counts), pass_rates(cur_counts), tau)
+    null_fwd, null_learn = [], []
+    for uid, (k_cur, n) in cur_counts.items():
+        k_old, m = old_counts[uid]
+        null_fwd.append(null_open_prob(k_old + k_cur, m, n, tau))
+        null_learn.append(null_open_prob(k_old + k_cur, n, m, tau))
+
+    count, null_sum, var_sum, excess, z = _against_null([gate[u] for u in cur_counts], null_fwd)
+    l_count, l_null_sum, l_var_sum, l_excess, l_z = _against_null([learn[u] for u in cur_counts], null_learn)
+    return {
+        f"{PREFIX}/gate_null_frac": null_sum / len(null_fwd),
+        f"{PREFIX}/gate_excess": excess,
+        f"{PREFIX}/gate_excess_z": z,
+        f"{PREFIX}/gate_open_count": count,
+        f"{PREFIX}/gate_null_sum": null_sum,
+        f"{PREFIX}/gate_null_var_sum": var_sum,
+        f"{PREFIX}/gate_learn_frac": l_count / len(null_learn),
+        f"{PREFIX}/gate_learn_excess": l_excess,
+        f"{PREFIX}/gate_learn_excess_z": l_z,
+        f"{PREFIX}/gate_learn_count": l_count,
+        f"{PREFIX}/gate_learn_null_sum": l_null_sum,
+        f"{PREFIX}/gate_learn_null_var_sum": l_var_sum,
+    }
+
+
 def build_train_batch(
     cur: DataProto,
     replay: DataProto | None,
-    p_old: dict[str, float] | None,
+    old_counts: dict[str, tuple[int, int]] | None,
     *,
     tau: float,
     coef: float,
@@ -132,13 +218,15 @@ def build_train_batch(
 ) -> tuple[DataProto, int, dict[str, float]]:
     """Assemble current rows, admitted replay rows and padding into one batch.
 
-    `cur` and `replay` are `train_view`s. `p_old` is None during the first `lag_steps` steps (no
-    replay was generated for those prompts yet). Sets `seq_advantages`; returns the batch, the number
-    of admitted replay rows, and metrics.
+    `cur` and `replay` are `train_view`s. `old_counts` (per-prompt (correct, samples) of the pi_lag
+    rollout) is None during the first `lag_steps` steps, when no replay was generated for those
+    prompts yet. Sets `seq_advantages`; returns the batch, the number of admitted replay rows, and
+    metrics.
     """
     cur_uids = cur.non_tensor_batch["uid"]
     cur_scores = seq_scores(cur)
-    p_cur = group_mean(cur_uids, cur_scores)
+    cur_counts = group_counts(cur_uids, cur_scores)
+    p_cur = pass_rates(cur_counts)
     cur_adv = cur_scores - np.array([p_cur[u] for u in cur_uids])
 
     pc = np.array(list(p_cur.values()))
@@ -148,9 +236,10 @@ def build_train_batch(
     }
     parts, advs = [cur], [cur_adv]
 
-    if p_old is not None:
+    if old_counts is not None:
         # Both come from the same _PromptBatch; a mismatch means replay was paired with the wrong step.
-        assert p_old.keys() == p_cur.keys(), "replay pass rates belong to a different prompt batch"
+        assert old_counts.keys() == cur_counts.keys(), "replay pass rates belong to a different prompt batch"
+        p_old = pass_rates(old_counts)
         gate = gate_open(p_cur, p_old, tau)
         deltas = np.array([p_old[u] - p_cur[u] for u in p_cur])
         metrics.update(
@@ -161,6 +250,7 @@ def build_train_batch(
                 f"{PREFIX}/p_old_mean": float(np.mean(list(p_old.values()))),
             }
         )
+        metrics.update(gate_noise_metrics(cur_counts, old_counts, gate, tau))
         # Logged whenever the gate was evaluated, so "nothing rescued" reads 0 rather than missing.
         rescued = set()
         if replay is not None and coef > 0:
