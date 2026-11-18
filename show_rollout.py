@@ -40,6 +40,18 @@ def main():
     print(f"实际执行次数: 最多 {max(execs)}，平均 {sum(execs) / n:.2f}")
     print(f"模型写出的 <tool_call>: 最多 {max(emitted)}，平均 {sum(emitted) / n:.2f}（高于执行数=有被丢弃或幻觉的）")
     print(f"score: 均值 {sum(scores) / n:.3f}，范围 [{min(scores)}, {max(scores)}]")
+
+    no_ans = [r for r in rows if "####" not in r["output"]]
+    print(f"没写 ####: {len(no_ans)} 条 ({len(no_ans) / n:.1%})")
+
+    # 思考模式（Qwen3 等）。stop 按字符串 </tool_call> 触发，<think> 里提到这个标签也会被截断：
+    # 能解析成合法调用就照常执行工具、进下一轮；解析不出来则整条轨迹直接结束（下面的“截断即结束”）。
+    if any("<think>" in r["output"] for r in rows):
+        unclosed = [r for r in rows if r["output"].count("<think>") > r["output"].count("</think>")]
+        cut = [r for r in unclosed if r["output"].rstrip().endswith("</tool_call>")]
+        print(f"[思考] 含 <think>: {sum('<think>' in r['output'] for r in rows) / n:.1%}")
+        print(f"[思考] <think> 多于 </think>: {len(unclosed)} 条 ({len(unclosed) / n:.1%})（下限，后续轮次可能补上 </think>）")
+        print(f"[思考]   其中以 </tool_call> 结尾，截断即结束: {len(cut)} 条 ({len(cut) / n:.1%})")
     if args.stats:
         return
 
