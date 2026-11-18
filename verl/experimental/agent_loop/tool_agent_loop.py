@@ -100,6 +100,22 @@ class ToolAgentLoop(AgentLoopBase):
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         print(f"Initialized tools: {cls.tools}")
 
+        # Stop each turn at the end of a tool call. Without this the model keeps generating past
+        # </tool_call> and writes the user/tool turns itself -- vLLM caps a turn at
+        # max_model_len - len(prompt_ids), not at response_length, so there is a lot of room to do
+        # so -- and every one of those fabricated tokens is marked response_mask=1, i.e. trained on.
+        # include_stop_str_in_output is required: HermesToolParser returns no tool calls when
+        # </tool_call> is missing from the text, which would silently end every trajectory after a
+        # single turn. Only wired up for vLLM: SGLang spells the same flag `no_stop_trim` (and
+        # already caps a turn at response_length), and the gpt-oss parser has no end token.
+        cls.tool_call_stop_kwargs = {}
+        tool_call_end_token = getattr(cls.tool_parser, "tool_call_end_token", None)
+        if tool_call_end_token and config.actor_rollout_ref.rollout.name == "vllm":
+            cls.tool_call_stop_kwargs = {
+                "stop": [tool_call_end_token],
+                "include_stop_str_in_output": True,
+            }
+
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         cls.response_length = config.actor_rollout_ref.rollout.response_length
@@ -213,11 +229,15 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the generating state: generate model response and check for tool calls."""
         add_messages: list[dict[str, Any]] = []
 
+        # Copy rather than mutate: the same sampling_params dict is handed to every trajectory in
+        # the batch.
+        turn_sampling_params = {**sampling_params, **self.tool_call_stop_kwargs}
+
         with simple_timer("generate_sequences", agent_data.metrics):
             output = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=agent_data.prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=turn_sampling_params,
                 image_data=agent_data.image_data,
             )
 

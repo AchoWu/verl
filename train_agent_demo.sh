@@ -22,6 +22,12 @@ bash examples/sglang_multiturn/run_qwen2.5-3b_gsm8k_tool_agent_mlflow.sh \
     trainer.logger='["console"]' \
     actor_rollout_ref.rollout.trace.backend=null \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    data.max_response_length=2048 \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=10 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=11 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     trainer.val_before_train=False \
     trainer.test_freq=-1 \
     trainer.rollout_data_dir="${DUMP_DIR}" \
