@@ -95,7 +95,8 @@ class HermesToolParser(ToolParser):
         for match in matches:
             try:
                 function_call = json.loads(match)
-                name, arguments = function_call["name"], function_call["arguments"]
+                # 无参工具常被模型写成 {"name": "foo"}，缺 arguments 不该让整个调用被丢掉
+                name, arguments = function_call["name"], function_call.get("arguments", {})
                 function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:
                 logger.error(f"Failed to decode tool call: {e}")
