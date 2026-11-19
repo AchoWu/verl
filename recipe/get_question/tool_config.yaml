@@ -1,0 +1,13 @@
+tools:
+  - class_name: "recipe.get_question.get_question_tool.GetQuestionTool"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "get_question"
+        description: "Retrieve the math problem you have to solve. The problem is not in the conversation, so call this first."
+        parameters:
+          type: "object"
+          properties: {}
+          required: []
