@@ -21,6 +21,7 @@ import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future
 from typing import Any, Optional
+from uuid import uuid4
 
 import hydra
 import numpy as np
@@ -102,8 +103,12 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
         server = self._choose_server(request_id)
+        # request_id is per trajectory and only picks the server (sticky, for prefix-cache reuse).
+        # vLLM gets a fresh id per call: a turn that ends on a stop string is finished by the
+        # frontend while the engine core still holds it until an abort arrives, and ToolAgentLoop
+        # submits the next turn as soon as the tool returns. Reusing the id lets the two collide.
         output = await server.generate.remote(
-            request_id=request_id,
+            request_id=uuid4().hex,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
