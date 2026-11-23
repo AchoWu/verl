@@ -36,13 +36,14 @@ USER_PROMPT = (
     "step and output the final answer after `####`."
 )
 
-# Every row's prompt would otherwise be byte-identical, since the question -- the only thing that
-# differs between samples -- now lives in tools_kwargs. vLLM died with a CUDA illegal memory
-# access partway through the first rollout on such a batch (all 8 engines in the same second,
-# at the same generation progress rather than the same wall-clock time), and survived the same
-# config with the varied prompts of the answer-checker dataset. Root cause is still unknown, so
-# this ID is a probe as much as a fix: it is the one thing the model cannot derive, and it leaks
-# nothing about the question or its answer.
+# Without this every row's prompt is byte-identical, since the question -- the only thing that
+# differs between samples -- now lives in tools_kwargs. The ID leaks nothing about the question or
+# its answer, and makes rows tell apart in rollout dumps.
+#
+# It was added suspecting identical prompts of a vLLM crash ("CUDA error: invalid argument" on all
+# 8 engines). They were not the cause: the crash persisted with the ID. The real cause was
+# ToolAgentLoop reusing one vLLM request id across turns, which leaves orphaned requests running
+# into the engine's sleep; see AsyncLLMServerManager.generate in verl/experimental/agent_loop.
 PROBLEM_ID_PREFIX = "Problem ID: {split}-{idx:05d}\n\n"
 
 
