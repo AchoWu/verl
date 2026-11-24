@@ -61,8 +61,10 @@ class GetCollectionInfoTool(BaseTool):
         script = record["script"]
         if len(script) > self.max_script_chars:
             script = script[: self.max_script_chars] + "..."
-        # The closing note is for the repeated calls: in the first smoke run 84% of trajectories
-        # called the tool two or three times, with ~3k tokens of script per call.
+        # The closing reminder restates what the user message asked for, because ~3k tokens of
+        # script now sit between that message and the answer: in the first smoke run 77% of
+        # trajectories had no <answer> (those inspected answered in bare 【...】 after </think>),
+        # and 84% called the tool again.
         text = (
             f"合集ID：{rowkey}\n"
             f"标题：{record['title']}\n"
@@ -70,6 +72,6 @@ class GetCollectionInfoTool(BaseTool):
             f"剧情背景：\n{record['cc_ai_video_summary']}\n\n"
             f"漫剧剧本：\n{script}\n\n"
             "（以上是该合集的全部内容，无需再次调用工具。请据此从候选标签中选择，"
-            "思考结束后直接输出选出的【标签】。）"
+            "并把选出的标签写在 <answer></answer> 内。）"
         )
         return ToolResponse(text=text), 0.0, {}

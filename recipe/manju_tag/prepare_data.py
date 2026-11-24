@@ -46,9 +46,9 @@ SYSTEM_PROMPT = (
     "再根据内容从候选标签中选出合适的标签。"
 )
 
-# The single-turn template asked for <think>...</think><answer>...</answer>. Qwen3 thinks in its own
-# <think> block and, asked for <answer> anyway, often put the labels straight after </think>; that
-# is now the format, and reward.py reads labels from there.
+# The single-turn template asked for <think>...</think><answer>...</answer>. Qwen3 already thinks
+# in its own <think> block, so only the answer format is specified here. The example uses
+# placeholders: real labels would nudge every answer toward them.
 USER_PROMPT = """请为合集 {collection_rowkey} 打【{category_cn}】类标签。
 
 下面是供选择的候选标签：
@@ -57,7 +57,7 @@ USER_PROMPT = """请为合集 {collection_rowkey} 打【{category_cn}】类标�
 注意：
 1. 先调用 `get_collection_info` 获取合集内容，不要凭空猜测；该工具只需调用一次；
 2. 你必须至少选择一个标签，如果所有标签都不贴切，则从兜底标签中选择最接近的；
-3. 思考结束后，直接输出选出的【标签】，多个标签用顿号分隔，不要输出其他内容。"""
+3. 最后必须把选出的【标签】写在 <answer></answer> 内，多个标签用顿号分隔，例如：<answer>【标签A】、【标签B】</answer>"""
 
 
 def load_tags(path):
