@@ -35,6 +35,8 @@ TOTAL_STEPS=${TOTAL_STEPS:-null}
 # rows only.
 max_prompt_length=${MAX_PROMPT_LEN:-8192}
 max_response_length=${RESP_LEN:-4096}
+# Sync (SPMD) vLLM with chunked prefill refuses to start unless rollout.max_num_batched_tokens
+# (default 8192) covers prompt + response; it is set to exactly that below.
 
 # ---- batch ----------------------------------------------------------------------------------
 train_batch_size=${TRAIN_BSZ:-128}    # ~6300 train rows -> ~49 steps per epoch
@@ -71,6 +73,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${micro_bsz} \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     custom_reward_function.path="$(pwd)/recipe/manju_tag/reward.py" \
     custom_reward_function.name=compute_score \
     +custom_reward_function.reward_kwargs.require_tool_call=False \
