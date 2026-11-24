@@ -4,7 +4,7 @@ tools:
       type: native
       # Written by prepare_data.py. Read by every AgentLoopWorker, so it must exist on each node.
       collections_path: "~/data/manju_tag/collections.jsonl"
-      # Same cut as the single-turn data. The tool's reply then stays under ~4300 chars, so keep
+      # Same cut as the single-turn data. The tool's reply then stays under ~4400 chars, so keep
       # multi_turn.max_tool_response_length (also in chars) above that or the script gets cut again.
       max_script_chars: 4000
     tool_schema:

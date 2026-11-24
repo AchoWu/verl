@@ -35,7 +35,7 @@ TOTAL_STEPS=${TOTAL_STEPS:-null}
 max_prompt_length=${MAX_PROMPT_LEN:-5120}
 # The tool's reply (up to ~3k tokens of script) sits inside the response, before the answer.
 max_response_length=${RESP_LEN:-8192}
-# In chars, applied to the tool's text. The tool cuts the script at 4000, its reply stays < 4300.
+# In chars, applied to the tool's text. The tool cuts the script at 4000, its reply stays < 4400.
 max_tool_response_length=5000
 
 # ---- batch ----------------------------------------------------------------------------------

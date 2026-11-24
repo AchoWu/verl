@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Set F1 between the labels in the final <answer> and the gold labels, for all four categories.
+"""Set F1 between the labels the model gives after it stops thinking and the gold labels.
 
 Hooked in with
     custom_reward_function.path=recipe/manju_tag/reward.py custom_reward_function.name=compute_score
@@ -19,10 +19,27 @@ Hooked in with
 
 import re
 
-ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 # Anything shaped like a label that is not one of this category's candidates: a label from another
 # category or a made-up one. Counted as a wrong pick, so it costs precision.
 LABEL_LIKE_RE = re.compile(r"(?:频道|情节|角色|时代)_[\u4e00-\u9fff]+")
+
+
+def extract_answer(solution_str: str):
+    """The model's final answer: what follows </think> in its last turn, or None if it gave none.
+
+    There is no <answer> block. Asked for one, 77% of trajectories in the first smoke run left it
+    out, and those inspected put the labels right after Qwen3's </think> instead. Only the last
+    turn counts -- after the last tool reply, so the tool's text and earlier turns are ignored. A
+    last turn with no </think> was cut off mid-thought, and one that calls a tool again ran into
+    the turn limit; neither is an answer.
+    """
+    last_turn = solution_str.rsplit("</tool_response>", 1)[-1]
+    if "</think>" not in last_turn:
+        return None
+    answer = last_turn.rsplit("</think>", 1)[1]
+    if "<tool_call>" in answer:
+        return None
+    return answer
 
 
 def extract_labels(answer: str, candidates) -> set[str]:
@@ -40,8 +57,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, requ
     extra_info = extra_info or {}
     gold = set(ground_truth)
 
-    answers = ANSWER_RE.findall(solution_str)
-    pred = extract_labels(answers[-1], extra_info["candidates"]) if answers else set()
+    answer = extract_answer(solution_str)
+    pred = extract_labels(answer, extra_info["candidates"]) if answer is not None else set()
 
     tp = len(pred & gold)
     precision = tp / len(pred) if pred else 0.0
@@ -64,5 +81,5 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, requ
         "precision": precision,
         "recall": recall,
         "called_tool": float(called_tool),
-        "has_answer": float(bool(answers)),
+        "has_answer": float(answer is not None),
     }
